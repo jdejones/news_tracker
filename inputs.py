@@ -5,7 +5,6 @@ Created on Fri Feb 11 10:15:52 2022
 @author: jdejo
 """
 if __name__ == "__main__":
-    from urllib.request import Request, urlopen
     from bs4 import BeautifulSoup as bs
     import bs4
     import nltk
