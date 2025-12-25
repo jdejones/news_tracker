@@ -21,6 +21,9 @@ import re
 # from NordVPN import NordVPN
 import datetime
 from pprint import pprint
+from api_keys import polygon_api_key
+from polygon.rest import RESTClient
+from finvizfinance.quote import finvizfinance
 pd.options.display.max_colwidth = 100
 
 ###############################################################################
@@ -395,3 +398,26 @@ class NewsImporter:
         for item in self.link_titles_all:
             self.polarity_scores[item] = self.sia.polarity_scores(item)
         
+    def symbol_news_polygon(self, symbol: str, from_date: str, limit: int = 10) -> list[str]:
+        client = RESTClient(polygon_api_key)
+        _news = []
+        for n in client.list_ticker_news(
+            ticker=symbol,
+            published_utc_gte=from_date,
+            order="asc",
+            limit=limit,
+            sort="published_utc",
+            ):
+            news.append(n)
+
+        news = []
+        # print date + title
+        for index, item in enumerate(news):
+            # verify this is an agg
+            if isinstance(item, TickerNews):
+                news.append(item.title)
+        return news
+    
+    def symbols_news_finviz(self, symbol: str) -> list[str]:
+        news = finvizfinance(symbol).news()
+        return news
