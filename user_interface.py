@@ -6,13 +6,24 @@ import re
 from pprint import pprint
 import time
 import hashlib
+from api_keys import news_database
 
-try:
-    import mysql.connector  # mysql-connector-python
-except Exception:
-    mysql = None
+from sqlalchemy import (
+    create_engine,
+    MetaData,
+    Table,
+    Integer,
+    Column,
+    Date,
+    Text,
+    String,
+    DateTime,
+    UniqueConstraint,
+    text as sql_text,
+    func,
+)
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 
-import api_keys
 
 class UserInterface(NewsImporter):
     def __init__(self):
@@ -63,23 +74,14 @@ class UserInterface(NewsImporter):
             return df3
         return self.headlines
     
-    def store_headlines(self, topic, headlines, dataframe=False):
+    def store_headlines(self, topic: str, headlines: list | pd.DataFrame, dataframe: bool = False):
         """
         Store `headlines` into a MySQL database named `headlines`.
 
         - Database: `headlines`
         - Table: derived from `topic` (sanitized)
         - Columns: saved_date, headline, headline_hash (used for de-duping)
-
-        Notes:
-        - DB password is sourced from `api_keys.py` (which is gitignored) and/or env vars.
-        - No secrets are printed/logged.
         """
-        if mysql is None:
-            raise ImportError(
-                "Missing dependency for MySQL. Install `mysql-connector-python` "
-                "(e.g. `pip install mysql-connector-python`)."
-            )
 
         if topic is None:
             raise ValueError("topic must be a non-empty string")
@@ -98,27 +100,20 @@ class UserInterface(NewsImporter):
         if not re.fullmatch(r"[a-zA-Z_][0-9a-zA-Z_]*", table):
             raise ValueError(f"Unsafe table name derived from topic: {table!r}")
 
-        # Pull MySQL config from api_keys (or env vars via api_keys defaults).
-        host = getattr(api_keys, "MYSQL_HOST", "localhost")
-        user = getattr(api_keys, "MYSQL_USER", "root")
-        port = int(getattr(api_keys, "MYSQL_PORT", 3306))
-        password = getattr(api_keys, "MYSQL_PASSWORD", "") or ""
-        if not password:
-            raise ValueError(
-                "MySQL password is missing. Set `MYSQL_PASSWORD` in `api_keys.py` "
-                "or set environment variable MYSQL_PASSWORD."
-            )
-
         # Normalize headlines into (saved_date, headline) rows.
         rows = []
         if headlines is None:
-            headlines = self.headlines
+            raise ValueError("headlines must be a non-empty list or dataframe")
 
         if isinstance(headlines, pd.DataFrame):
             # Prefer a 'headlines' column, else use the first column.
             if "headlines" in headlines.columns:
                 series = headlines["headlines"]
             else:
+                if len(headlines.columns) > 1:
+                    raise ValueError("headlines dataframe must have a 'headlines' column or be a single column")
+                elif len(headlines.columns) == 0:
+                    raise ValueError("headlines dataframe must have at least one column")
                 series = headlines.iloc[:, 0]
 
             for idx, val in series.items():
@@ -145,46 +140,38 @@ class UserInterface(NewsImporter):
         if not rows:
             return pd.DataFrame(columns=["saved_date", "headline"]) if dataframe else 0
 
-        # Connect, create DB + table, insert with de-dupe on headline_hash.
-        cnx = mysql.connector.connect(
-            host=host,
-            user=user,
-            password=password,
-            port=port,
+        # SQLAlchemy connection URL (mysql-connector-python driver).
+        url = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
+
+        # Create database if needed (connect at server level).
+        engine = create_engine(url, pool_pre_ping=True, connect_args={'connect_timeout': 5})
+
+
+        # Create/reflect table in `headlines` database.
+        metadata = MetaData()
+        headlines_table = Table(
+            table,
+            metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("saved_date", Date, nullable=False),
+            Column("headline", Text, nullable=False),
+            Column("headline_hash", String(32), nullable=False),
+            Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
+            UniqueConstraint("headline_hash", name="uniq_headline_hash"),
+            mysql_charset="utf8mb4",
         )
-        try:
-            cur = cnx.cursor()
-            cur.execute("CREATE DATABASE IF NOT EXISTS `headlines` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
-            cur.execute("USE `headlines`;")
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS `{table}` (
-                    id INT NOT NULL AUTO_INCREMENT,
-                    saved_date DATE NOT NULL,
-                    headline TEXT NOT NULL,
-                    headline_hash CHAR(32) NOT NULL,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (id),
-                    UNIQUE KEY uniq_headline_hash (headline_hash)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-                """
-            )
+        metadata.create_all(engine)
 
-            insert_sql = f"INSERT IGNORE INTO `{table}` (saved_date, headline, headline_hash) VALUES (%s, %s, %s);"
-            payload = []
-            for saved_date, text in rows:
-                h = hashlib.md5(text.encode("utf-8")).hexdigest()
-                payload.append((saved_date, text, h))
+        payload = []
+        for saved_date, text in rows:
+            h = hashlib.md5(text.encode("utf-8")).hexdigest()
+            payload.append({"saved_date": saved_date, "headline": text, "headline_hash": h})
 
-            cur.executemany(insert_sql, payload)
-            cnx.commit()
-
-            inserted = cur.rowcount
-        finally:
-            try:
-                cnx.close()
-            except Exception:
-                pass
+        # INSERT IGNORE (de-dupe on uniq_headline_hash).
+        stmt = mysql_insert(headlines_table).values(payload).prefix_with("IGNORE")
+        with engine.begin() as conn:
+            result = conn.execute(stmt)
+            inserted = int(result.rowcount or 0)
 
         if dataframe:
             return pd.DataFrame({"saved_date": [r[0] for r in rows], "headline": [r[1] for r in rows]})
@@ -202,8 +189,6 @@ class UserInterface(NewsImporter):
                 elif todo == 'check':
                     pprint(tag)
                     pprint(self.find_headline(tag, check_dataframe=True))
-
-
 
     def ngram_headline_polarity_scores(self, ngram):
         headlines = []
