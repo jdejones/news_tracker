@@ -1,39 +1,17 @@
-from bs4 import BeautifulSoup as bs
-import bs4
 import nltk
 nltk.download('punkt_tab')
 from nltk.tokenize import word_tokenize
 from nltk.probability import FreqDist
-from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer
 from nltk.stem.wordnet import WordNetLemmatizer
 from support_functions import *
 from sources import *
 from nltk.sentiment import SentimentIntensityAnalyzer
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-import time
-import io
-import os
-import stem.process
-import re
-# from NordVPN import NordVPN
-import datetime
-from pprint import pprint
 from api_keys import polygon_api_key
 from polygon.rest import RESTClient
 from finvizfinance.quote import finvizfinance
 pd.options.display.max_colwidth = 100
-
-###############################################################################
-#Connect to VPN
-# nvpn = NordVPN()
-# print(f'IP before connect {nvpn.check_ip()}')
-# nvpn.connect()
-# time.sleep(30)
-# print(f'IP after connect {nvpn.check_ip()}')
-###############################################################################
 
 
 class NewsImporter:
@@ -418,6 +396,7 @@ class NewsImporter:
                 news.append(item.title)
         return news
     
-    def symbols_news_finviz(self, symbol: str) -> list[str]:
+    def symbol_news_finviz(self, symbol: str) -> list[str]:
         news = finvizfinance(symbol).news()
         return news
+
