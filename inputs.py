@@ -8,9 +8,10 @@ from support_functions import *
 from sources import *
 from nltk.sentiment import SentimentIntensityAnalyzer
 import pandas as pd
-from api_keys import polygon_api_key
+from api_keys import polygon_api_key, serpapi_api_key
 from polygon.rest import RESTClient
 from finvizfinance.quote import finvizfinance
+import serpapi
 pd.options.display.max_colwidth = 100
 
 
@@ -400,3 +401,25 @@ class NewsImporter:
         news = finvizfinance(symbol).news()
         return news
 
+    def google_search(self, 
+                      search_text: str, 
+                      location: str = "Austin, Texas, United States",
+                      return_raw: bool = False) -> list[str]:
+        params = {
+        "engine": "google_news",
+        "q": f"site:{search_text}",
+        "location": location,
+        "hl": "en",
+        "gl": "us",
+        "api_key": serpapi_api_key
+        }
+
+        search = serpapi.search(params)
+        
+        if return_raw:
+            return search
+        else:
+            return [
+                (item["title"], item["link"]) #, item["snippet"]
+                    for item in search["news_results"]
+                    ]

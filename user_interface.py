@@ -198,14 +198,14 @@ class UserInterface(NewsImporter):
         for headline in headlines:
             polarity_scores[headline] = sia.polarity_scores(headline)
 
-    def google_search(self, search_text):
+    def browser_search(self, search_text):
         from selenium import webdriver
         chrome_options = webdriver.ChromeOptions()
         chrome_options.add_experimental_option("detach", True)
         driver = webdriver.Chrome(r"C:\Users\jdejo\OneDrive\Desktop\chromedriver_win32 (1)\chromedriver.exe", options=chrome_options)
         driver.get(r"https://www.google.com/search?q=" + search_text)
 
-    def google_searches(self, search_items):
+    def browser_searches(self, search_items):
         chrome_options = webdriver.ChromeOptions()
         chrome_options.add_experimental_option("detach", True)
         driver = webdriver.Chrome(r"C:\Users\jdejo\OneDrive\Desktop\chromedriver_win32 (1)\chromedriver.exe", options=chrome_options)
@@ -236,4 +236,5 @@ class UserInterface(NewsImporter):
         df = pd.concat([mono_ngrams_series, mono_n_series, bi_ngrams_series, bi_n_series, tri_ngrams_series, tri_n_series],  axis=1)
         df.columns = pd.MultiIndex.from_tuples((('mono', 'ngrams'), ('mono', 'n'),('bi', 'ngrams'), ('bi', 'n'), ('tri', 'ngrams'), ('tri', 'n')))
         return df
+    
     
