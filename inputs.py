@@ -80,7 +80,7 @@ class NewsImporter:
         self.polarity_scores = []
         self.headlines = []
     
-    def scrape_news(self):
+    def frontpage_headlines(self):
         #src1 news scraper
         source = src1
         soup = basic_bsoup(source)
@@ -404,9 +404,10 @@ class NewsImporter:
     def google_search(self, 
                       search_text: str, 
                       location: str = "Austin, Texas, United States",
+                      engine: str = "google",
                       return_raw: bool = False) -> list[str]:
         params = {
-        "engine": "google_news",
+        "engine": engine,
         "q": f"site:{search_text}",
         "location": location,
         "hl": "en",
@@ -419,7 +420,13 @@ class NewsImporter:
         if return_raw:
             return search
         else:
+            if engine == "google":
+                return [
+                    (item["title"], item["link"], item["snippet"])
+                        for item in search["organic_results"]
+                        ]
             return [
-                (item["title"], item["link"]) #, item["snippet"]
+                (item["title"], item["link"])
                     for item in search["news_results"]
                     ]
+
