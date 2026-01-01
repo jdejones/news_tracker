@@ -80,7 +80,7 @@ class NewsImporter:
         self.polarity_scores = []
         self.headlines = []
     
-    def frontpage_headlines(self):
+    def frontpage_headlines(self, clean_headlines: bool = True):
         #src1 news scraper
         source = src1
         soup = basic_bsoup(source)
@@ -295,6 +295,8 @@ class NewsImporter:
                         self.link_titles_src8 + self.link_titles_src1 + \
                         self.link_titles_src11 + self.link_titles_src13 + \
                         self.link_titles_src12
+        if clean_headlines:
+            self.link_titles_all = [item for item in self.link_titles_all if len(str(item).strip().split(' ')) > 3]
         ###############################################################################
         ###############################################################################
 
@@ -309,6 +311,8 @@ class NewsImporter:
                 self.link_titles_src11_for_df + \
                 self.link_titles_src12_for_df + self.link_titles_src13_for_df
         self.links_df = pd.DataFrame(self.links_for_df, columns=['headline', 'link', 'source'])
+        if clean_headlines:
+            self.links_df = self.links_df[self.links_df['headline'].apply(lambda x: len(str(x).strip().split(' ')) > 3)]
         ###############################################################################
         ###############################################################################
         
