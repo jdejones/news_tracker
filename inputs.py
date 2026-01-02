@@ -4,7 +4,7 @@ from nltk.tokenize import word_tokenize
 from nltk.probability import FreqDist
 from nltk.stem import PorterStemmer
 from nltk.stem.wordnet import WordNetLemmatizer
-from support_functions import *
+from utils import *
 from sources import *
 from nltk.sentiment import SentimentIntensityAnalyzer
 import pandas as pd

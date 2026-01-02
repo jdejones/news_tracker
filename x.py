@@ -320,3 +320,4 @@ class post_scheduler:
                 failed_count += 1
         
         print(f"\nScheduling complete: {scheduled_count} successful, {failed_count} failed")
+        

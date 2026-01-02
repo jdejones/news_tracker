@@ -74,7 +74,10 @@ class UserInterface(NewsImporter):
             return df3
         return self.headlines
     
-    def store_headlines(self, topic: str, headlines: list | pd.DataFrame, dataframe: bool = False):
+    def store_headlines(self, 
+                        topic: str, 
+                        headlines: list[str, str] | pd.DataFrame, 
+                        dataframe: bool = False):
         """
         Store `headlines` into a MySQL database named `headlines`.
 
@@ -107,35 +110,15 @@ class UserInterface(NewsImporter):
 
         if isinstance(headlines, pd.DataFrame):
             # Prefer a 'headlines' column, else use the first column.
-            if "headlines" in headlines.columns:
-                series = headlines["headlines"]
+            if ("headline" in headlines.columns) and ('link' in headlines.columns):
+                rows = [(datetime.date.today(), row['headline'], row['link']) for _, row in headlines.iterrows()]
             else:
-                if len(headlines.columns) > 1:
-                    raise ValueError("headlines dataframe must have a 'headlines' column or be a single column")
-                elif len(headlines.columns) == 0:
-                    raise ValueError("headlines dataframe must have at least one column")
-                series = headlines.iloc[:, 0]
-
-            for idx, val in series.items():
-                text = "" if val is None else str(val).strip()
-                if not text:
-                    continue
-                try:
-                    d = pd.to_datetime(idx).date()
-                except Exception:
-                    d = datetime.date.today()
-                rows.append((d, text))
+                raise ValueError("headlines dataframe must have a 'headline' and 'link' column")
         else:
-            for item in headlines:
-                if item is None:
+            for headline, link in headlines:
+                if headline is None:
                     continue
-                if isinstance(item, (tuple, list)) and len(item) >= 2:
-                    text = "" if item[1] is None else str(item[1]).strip()
-                else:
-                    text = str(item).strip()
-                if not text:
-                    continue
-                rows.append((datetime.date.today(), text))
+                rows.append((datetime.date.today(), headline, link))
 
         if not rows:
             return pd.DataFrame(columns=["saved_date", "headline"]) if dataframe else 0
@@ -155,6 +138,7 @@ class UserInterface(NewsImporter):
             Column("id", Integer, primary_key=True, autoincrement=True),
             Column("saved_date", Date, nullable=False),
             Column("headline", Text, nullable=False),
+            Column("link", Text, nullable=True),
             Column("headline_hash", String(32), nullable=False),
             Column("created_at", DateTime, nullable=False, server_default=func.current_timestamp()),
             UniqueConstraint("headline_hash", name="uniq_headline_hash"),
@@ -163,9 +147,9 @@ class UserInterface(NewsImporter):
         metadata.create_all(engine)
 
         payload = []
-        for saved_date, text in rows:
+        for saved_date, text, link in rows:
             h = hashlib.md5(text.encode("utf-8")).hexdigest()
-            payload.append({"saved_date": saved_date, "headline": text, "headline_hash": h})
+            payload.append({"saved_date": saved_date, "headline": text, "link": link, "headline_hash": h})
 
         # INSERT IGNORE (de-dupe on uniq_headline_hash).
         stmt = mysql_insert(headlines_table).values(payload).prefix_with("IGNORE")
@@ -174,7 +158,7 @@ class UserInterface(NewsImporter):
             inserted = int(result.rowcount or 0)
 
         if dataframe:
-            return pd.DataFrame({"saved_date": [r[0] for r in rows], "headline": [r[1] for r in rows]})
+            return pd.DataFrame({"saved_date": [r[0] for r in rows], "headline": [r[1] for r in rows], "link": [r[2] for r in rows]})
         return inserted
 
     def get_tags(folder=r"E:\Market Research\Dataset\News\Market News\tags"):
@@ -237,4 +221,6 @@ class UserInterface(NewsImporter):
         df.columns = pd.MultiIndex.from_tuples((('mono', 'ngrams'), ('mono', 'n'),('bi', 'ngrams'), ('bi', 'n'), ('tri', 'ngrams'), ('tri', 'n')))
         return df
     
-    
+    def _headline_to_link(self, headlines: list[int, str]):
+        return self.links_df.loc[self.links_df.headline == headlines[1]]['link'].values[0]
+
