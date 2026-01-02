@@ -10,6 +10,7 @@ from api_keys import news_database
 
 from sqlalchemy import (
     create_engine,
+    inspect,
     MetaData,
     Table,
     Integer,
@@ -73,6 +74,16 @@ class UserInterface(NewsImporter):
             df3.drop_duplicates(inplace=True)
             return df3
         return self.headlines
+    
+    def get_tables(self):
+        """Get list of all table names in the 'news' database."""
+        url = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
+        engine = create_engine(url, pool_pre_ping=True, connect_args={'connect_timeout': 5})
+        
+        inspector = inspect(engine)
+        table_names = inspector.get_table_names()
+        
+        return table_names    
     
     def store_headlines(self, 
                         topic: str, 
