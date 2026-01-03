@@ -10,18 +10,32 @@ from dataclasses import dataclass
 from collections import deque
 
 # Add parent directories to path to import x.py
-sys.path.insert(0, r"C:\Users\jdejo\News_Tracker")
-# script_dir = os.path.dirname(os.path.abspath(__file__))
-# project_root = os.path.dirname(os.path.dirname(os.path.dirname(script_dir)))
-# sys.path.insert(0, project_root)
+# Use realpath to handle symlinks and ensure correct path resolution
+# even when run from Windows Task Scheduler with different working directory
+# Get the absolute path of this script file
+# __file__ is always set when running as a script
+# Use realpath to resolve any symlinks and get canonical path
+# This ensures correct path resolution even when Task Scheduler
+# runs the script with a different working directory
+script_file = os.path.realpath(os.path.abspath(__file__))
+
+# Get script directory and project root (two levels up)
+script_dir = os.path.dirname(script_file)
+project_root = os.path.dirname(os.path.dirname(script_dir))
+
+# Validate that project_root exists and contains expected files
+if not os.path.exists(project_root) or not os.path.exists(os.path.join(project_root, 'x.py')):
+    raise ValueError(f"Invalid project_root: {project_root}")
+
+sys.path.insert(0, project_root)
 
 from x import Post_Constructor, post_scheduler, scheduled_post
 
 
 def main():
     # Change to project root directory to ensure relative imports work
-    os.chdir(r"C:\Users\jdejo\News_Tracker")
-    # os.chdir(project_root)  
+    # os.chdir(r"C:\Users\jdejo\News_Tracker")
+    os.chdir(project_root)  
     try:
         scheduler = post_scheduler()
         
