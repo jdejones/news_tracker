@@ -1,3 +1,16 @@
 sources.py
 api_keys.py
 scheduled_posts.txt
+
+#Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment variables
+.env
+
+# Jupyter Notebooks (if you want to ignore all)
+*.ipynb_checkpoints
