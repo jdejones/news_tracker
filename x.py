@@ -97,7 +97,7 @@ class Post_Constructor():
                        snippet: [str|None]=None,
                        symbol: str|None=None) -> str:
         if symbol:
-            headline = f"${symbol} {headline}"
+            headline = f"${symbol}\n {headline}"
         if snippet:
             post = self.x_post(text=f"{headline} {snippet}")
             if link:
@@ -252,8 +252,27 @@ class post_scheduler:
         script_path = os.path.join(script_dir, 'usage', 'scripts', 'scheduled_post.py')
         script_path = os.path.normpath(script_path)
         
-        # Get Python executable path
+        # Get Python executable path - use pythonw.exe for headless execution (no console window)
         python_exe = sys.executable
+        # Replace python.exe with pythonw.exe to run without console window
+        if python_exe.endswith('python.exe'):
+            pythonw_exe = python_exe.replace('python.exe', 'pythonw.exe')
+            # Verify pythonw.exe exists, fallback to python.exe if not
+            if os.path.exists(pythonw_exe):
+                python_exe = pythonw_exe
+            else:
+                print(f"Warning: pythonw.exe not found at {pythonw_exe}, using python.exe (console window will appear)")
+        elif python_exe.endswith('pythonw.exe'):
+            # Already using pythonw.exe
+            pass
+        else:
+            # Try to find pythonw.exe in the same directory
+            python_dir = os.path.dirname(python_exe)
+            pythonw_exe = os.path.join(python_dir, 'pythonw.exe')
+            if os.path.exists(pythonw_exe):
+                python_exe = pythonw_exe
+            else:
+                print(f"Warning: pythonw.exe not found, using {python_exe} (console window may appear)")
         
         scheduled_count = 0
         failed_count = 0
