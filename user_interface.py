@@ -75,7 +75,7 @@ class UserInterface(NewsImporter):
             return df3
         return self.headlines
     
-    def get_tables(self):
+    def get_tables(self) -> list[str]:
         """Get list of all table names in the 'news' database."""
         url = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
         engine = create_engine(url, pool_pre_ping=True, connect_args={'connect_timeout': 5})
@@ -87,7 +87,7 @@ class UserInterface(NewsImporter):
     
     def store_headlines(self, 
                         topic: str, 
-                        headlines: list[str, str] | pd.DataFrame, 
+                        headlines: list[int|str, str] | pd.DataFrame, 
                         dataframe: bool = False):
         """
         Store `headlines` into a MySQL database named `headlines`.
@@ -113,6 +113,16 @@ class UserInterface(NewsImporter):
         table = table[:64]
         if not re.fullmatch(r"[a-zA-Z_][0-9a-zA-Z_]*", table):
             raise ValueError(f"Unsafe table name derived from topic: {table!r}")
+        
+        #Remove headlines if previously stored
+        if topic in self.get_tables():
+            url = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
+            engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+
+            # query database -> DataFrame
+            table = pd.read_sql(f"SELECT * FROM {topic}", con=engine)
+            headlines = [headline for headline in headlines if headline not in table['headline'].values]
+            
 
         # Normalize headlines into (saved_date, headline) rows.
         rows = []
@@ -126,10 +136,14 @@ class UserInterface(NewsImporter):
             else:
                 raise ValueError("headlines dataframe must have a 'headline' and 'link' column")
         else:
-            for headline, link in headlines:
-                if headline is None:
-                    continue
-                rows.append((datetime.date.today(), headline, link))
+            if not isinstance(headlines, list):
+                headlines = [headlines]
+            headlines = self._headline_to_link(headlines)
+            if ("headline" in headlines.columns) and ('link' in headlines.columns):
+                rows = [(datetime.date.today(), row['headline'], row['link']) for _, row in headlines.iterrows()]
+            else:
+                raise ValueError("headlines dataframe must have a 'headline' and 'link' column")
+
 
         if not rows:
             return pd.DataFrame(columns=["saved_date", "headline"]) if dataframe else 0
@@ -233,5 +247,7 @@ class UserInterface(NewsImporter):
         return df
     
     def _headline_to_link(self, headlines: list[int, str]):
-        return self.links_df.loc[self.links_df.headline == headlines[1]]['link'].values[0]
+        if isinstance(headlines, tuple):
+            return self.links_df.loc[self.links_df.headline == headlines[1]][['headline', 'link']]
+        return self.links_df.loc[self.links_df.headline.isin([_[1] for _ in headlines])][['headline', 'link']]
 
