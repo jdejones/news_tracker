@@ -1,5 +1,6 @@
 from inputs import NewsImporter
 import pandas as pd
+pd.set_option("display.max_colwidth", None)
 import datetime
 import os
 import re
@@ -185,6 +186,12 @@ class UserInterface(NewsImporter):
         if dataframe:
             return pd.DataFrame({"saved_date": [r[0] for r in rows], "headline": [r[1] for r in rows], "link": [r[2] for r in rows]})
         return inserted
+
+    def retrieve_headlines(self, topic: str):
+        url = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
+        engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+        table = pd.read_sql(f"SELECT * FROM {topic}", con=engine)
+        return table
 
     def get_tags(folder=r"E:\Market Research\Dataset\News\Market News\tags"):
         return os.listdir(folder)
