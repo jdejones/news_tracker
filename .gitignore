@@ -14,6 +14,7 @@ __pycache__/
 
 # Jupyter Notebooks (if you want to ignore all)
 *.ipynb_checkpoints
+*.ipynb
 working_notebook.ipynb
 
 # Pickle artifacts
