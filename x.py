@@ -249,7 +249,7 @@ class post_scheduler:
         
         # Get the absolute path to the script
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        script_path = os.path.join(script_dir, 'usage', 'scripts', 'scheduled_post.py')
+        script_path = os.path.join(script_dir, 'scripts', 'scheduled_post.py')
         script_path = os.path.normpath(script_path)
         
         # Get Python executable path - use pythonw.exe for headless execution (no console window)
