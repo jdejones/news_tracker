@@ -1,6 +1,5 @@
 import tweepy
 from api_keys import bearer_token, consumer_key, consumer_secret, access_token, access_token_secret
-from inputs import NewsImporter
 import json
 import datetime
 from dataclasses import dataclass, asdict, field
@@ -10,10 +9,15 @@ import os
 import sys
 
 
+SCHEDULED_POSTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduled_posts.txt")
+
 
 class Post_Constructor():
     def __init__(self):
-        self.news_importer = NewsImporter()
+        # Kept for backward compatibility (older code referenced this attr),
+        # but we avoid importing `inputs.py` here because it has heavy import-time
+        # side effects (e.g., NLTK downloads) that are not needed for posting.
+        self.news_importer = None
         self.news_results = None
         
     def get_news(self, provider: list|None):
@@ -110,20 +114,36 @@ class Post_Constructor():
     
 
 @dataclass
-class scheduled_post:
+class ScheduledPost:
     headline: str
     scheduled_time: datetime.datetime
-    post_id: int = len(json.load(open(r"C:\Users\jdejo\News_Tracker\scheduled_posts.txt"))) + 1
+    # Compute lazily at instance creation time (avoid file IO at import time).
+    post_id: int = field(default_factory=lambda: _next_scheduled_post_id())
     link: str = None
     snippet: str = None
     symbol: str = None
     priority: int = 0
 
-class post_scheduler:
+
+def _next_scheduled_post_id() -> int:
+    """
+    Best-effort next ID from `scheduled_posts.txt` located next to this file.
+    Falls back to 1 if the file is missing/corrupt.
+    """
+    try:
+        with open(SCHEDULED_POSTS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return len(data) + 1
+    except Exception:
+        pass
+    return 1
+
+class PostScheduler:
     def __init__(self):
         """Initialize scheduler and load posts from file"""
         try:
-            with open(r'C:\Users\jdejo\News_Tracker\scheduled_posts.txt', 'r') as f:
+            with open(SCHEDULED_POSTS_PATH, "r", encoding="utf-8") as f:
                 content = f.read().strip()
                 # Handle corrupted file (string representation of deque)
                 if content.startswith('"deque') or content.startswith("'deque"):
@@ -164,10 +184,10 @@ class post_scheduler:
             print(f"Warning: Error loading scheduled_posts.txt: {e}")
             self.scheduled_posts = deque()
     
-    def enqueue_post(self, post: scheduled_post, priority: int = None):
+    def enqueue_post(self, post: ScheduledPost, priority: int = None):
         """Add a post to the back of the queue"""
         # Convert scheduled_post dataclass to dict
-        if isinstance(post, scheduled_post):
+        if isinstance(post, ScheduledPost):
             post = asdict(post)
         if isinstance(post['scheduled_time'], datetime.datetime):
             post['scheduled_time'] = post['scheduled_time'].strftime('%Y-%m-%d %H:%M:%S')
@@ -185,7 +205,7 @@ class post_scheduler:
             self.scheduled_posts.append(post)
         self.save_queue()
     
-    def enqueue_posts(self, posts: list[scheduled_post]):
+    def enqueue_posts(self, posts: list[ScheduledPost]):
         """Add multiple posts to the back of the queue"""
         # Convert scheduled_post dataclasses to dicts
         post_dicts = []
@@ -196,7 +216,7 @@ class post_scheduler:
         self.scheduled_posts.extend(post_dicts)
         self.save_queue()
         
-    def dequeue_post(self, by_index: int = 0) -> scheduled_post:
+    def dequeue_post(self, by_index: int = 0) -> ScheduledPost:
         """Remove and return the post from the front of the queue"""
         if self.is_empty():
             raise IndexError("Queue is empty")
@@ -210,7 +230,7 @@ class post_scheduler:
         self.save_queue()  # Save after removing
         return post
     
-    def _post_to_dict(self, post: scheduled_post) -> dict:
+    def _post_to_dict(self, post: ScheduledPost) -> dict:
         """Convert post to dictionary with datetime serialization"""
         post_dict = asdict(post)
         post_dict['scheduled_time'] = post.scheduled_time.strftime('%Y-%m-%d %H:%M:%S')
@@ -224,7 +244,7 @@ class post_scheduler:
         for post_dict in list_of_dicts:
             if 'scheduled_time' in post_dict and isinstance(post_dict['scheduled_time'], datetime.datetime):
                 post_dict['scheduled_time'] = post_dict['scheduled_time'].strftime('%Y-%m-%d %H:%M:%S')
-        with open('scheduled_posts.txt', 'w') as f:
+        with open(SCHEDULED_POSTS_PATH, "w", encoding="utf-8") as f:
             json.dump(list_of_dicts, f, indent=2)
             
     def is_empty(self) -> bool:
@@ -340,3 +360,7 @@ class post_scheduler:
         
         print(f"\nScheduling complete: {scheduled_count} successful, {failed_count} failed")
         
+
+# Backwards-compatible aliases (used by older notebooks/scripts)
+scheduled_post = ScheduledPost
+post_scheduler = PostScheduler
