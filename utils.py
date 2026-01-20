@@ -33,5 +33,5 @@ finviz_api_urls = {
     "crypto_feed": f"https://elite.finviz.com/news_export.ashx?v=5&auth={finviz_api_key}",
     "stock_news": f"https://elite.finviz.com/news_export.ashx?v=3&t=symbol&auth={finviz_api_key}",
     "crypto_news": f"https://elite.finviz.com/news_export.ashx?v=5&t=symbol&auth={finviz_api_key}",
-    "screener": f"https://elite.finviz.com/export.ashx?v=152&c=0,1,2,3,4,5,6,24,25,30,42,43,44,45,46,47,48,49,50,51,60,61,63,64,66,67&auth={finviz_api_key}"
+    "screener": f"https://elite.finviz.com/export.ashx?v=152&c=0,1,2,3,4,5,6,24,25,30,42,43,44,45,46,47,48,49,50,51,60,61,63,64,66,67,136,137&auth={finviz_api_key}"
 }
