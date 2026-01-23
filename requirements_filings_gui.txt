@@ -1,0 +1,7 @@
+PyQt6
+PyQt6-WebEngine
+websockets
+colorama
+openai>=1.55.0
+tweepy
+
