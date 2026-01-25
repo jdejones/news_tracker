@@ -40,5 +40,5 @@ def main():
 
 if __name__ == "__main__":
     symbols_to_update = main()
-    print(f"Symbols updated: {symbols_to_update}")
+    print(f"Symbols updated")
 
