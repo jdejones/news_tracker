@@ -33,9 +33,9 @@ class FinvizNewsImporter:
     def get_finviz_url_with_symbol(self) -> str:
         """Get finviz URL that requires a symbol parameter"""
         if self.url == "stock_news":
-            return f"https://elite.finviz.com/news_export.ashx?v=3&t=symbol&auth={finviz_api_key}".replace("symbol", self.symbol)
+            return f"https://elite.finviz.com/news_export.ashx?v=3&t={self.symbol}&auth={finviz_api_key}"
         elif self.url == "crypto_news":
-            return f"https://elite.finviz.com/news_export.ashx?v=5&t=symbol&auth={finviz_api_key}".replace("symbol", self.symbol)
+            return f"https://elite.finviz.com/news_export.ashx?v=5&t={self.symbol}&auth={finviz_api_key}"
         else:
             raise ValueError(f"Unknown URL type: {self.url}")
         
@@ -45,6 +45,10 @@ class FinvizNewsImporter:
         self.symbol = symbol
         self.finviz_api_key = finviz_api_key
         if self.symbol:
+            # Allow batching: symbol can be a list like ["AAPL", "MSFT"].
+            # Always join lists (including length 1) to avoid URLs like "t=['AAPL']".
+            if isinstance(self.symbol, list):
+                self.symbol = ",".join([str(s) for s in self.symbol])
             self.url = self.get_finviz_url_with_symbol()
     
 
@@ -71,6 +75,7 @@ class Controller:
         self.cache_most_recent_link = pd.read_sql("SELECT * FROM cache_most_recent_link", con=self.engine)
         self.most_recent_link_all_df = None
         self.q = NewsQueue()
+        self.most_recent_updates = [line.strip() for line in open(Path(__file__).resolve().with_name('most_recent_updates.txt'), 'r')]
 
     def _ensure_symbol_news_table(self, symbol: str) -> None:
         """
@@ -80,12 +85,13 @@ class Controller:
             Title, Source, Date, Url, Category, Ticker
         """
         insp = inspect(self.engine)
-        if symbol.lower() in insp.get_table_names():
+        table_name = symbol.lower()
+        if table_name in insp.get_table_names():
             return
 
         md = MetaData()
         Table(
-            symbol,
+            table_name,
             md,
             Column("Title", Text, nullable=True),
             Column("Source", String(255), nullable=True),
@@ -98,22 +104,24 @@ class Controller:
         md.create_all(self.engine)
 
     def _most_recent_link_symbol_cached(self, symbol: str) -> str:
-        return self.cache_most_recent_link.loc[self.cache_most_recent_link['Ticker'] == symbol.upper(), 'News URL'].values[0]
+        return self.cache_most_recent_link.loc[self.cache_most_recent_link['Ticker'] == symbol.upper(), 'News_URL'].values[0]
     
     def _most_recent_link_all(self) -> pd.DataFrame:
         response = requests.get(finviz_api_urls['screener'])
         response_text = response.content.decode('utf-8')
         df = pd.read_csv(StringIO(response_text))
-        self.most_recent_link_all_df = df[['Ticker', 'News URL']]
+        df = df.loc[~df['Ticker'].isna()]
+        df.columns = [col.replace(' ', '_') for col in df.columns]
+        self.most_recent_link_all_df = df[['Ticker', 'News_URL']]
         
     def _compare_most_recent_link(self, symbol:str) -> bool:
         #TODO Would this be more to make the comparison during initialization and store the symbol in a list?
         if self.most_recent_link_all_df is None:
             self._most_recent_link_all()
-        return self._most_recent_link_symbol_cached(symbol) == self.most_recent_link_all_df.loc[self.most_recent_link_all_df['Ticker'] == symbol.upper(), 'News URL'].values[0]
+        return self._most_recent_link_symbol_cached(symbol) == self.most_recent_link_all_df.loc[self.most_recent_link_all_df['Ticker'] == symbol.upper(), 'News_URL'].values[0]
     
     def _update_most_recent_link_cached(self, symbol: str, link: str):
-        self.cache_most_recent_link.loc[self.cache_most_recent_link['Ticker'] == symbol.upper(), 'News URL'] = link
+        self.cache_most_recent_link.loc[self.cache_most_recent_link['Ticker'] == symbol.upper(), 'News_URL'] = link
         self.cache_most_recent_link.to_sql("cache_most_recent_link", con=self.engine, if_exists='replace', index=False)
     
     def _update_most_recent_link_cached_all(self):
@@ -121,18 +129,20 @@ class Controller:
         self.most_recent_link_all_df.to_sql("cache_most_recent_link", con=self.engine, if_exists='replace', index=False)
 
     def _load_queue(self):
-        self.q = self.q.load_pickle()
+        # Always load from repo root (same folder as this module).
+        self.q = self.q.load_pickle(Path(__file__).resolve().with_name("news_queue.pkl"))
     
     def _save_queue(self):
-        self.q.save_pickle()
+        # Always save to repo root (same folder as this module).
+        self.q.save_pickle(Path(__file__).resolve().with_name("news_queue.pkl"))
     
     def _assign_skip_status(self):
         if self.most_recent_link_all_df is None:
             self._most_recent_link_all()
         for node in self.q.queue:
                 if (node.symbol.upper() in self.most_recent_link_all_df['Ticker'].values) and (node.symbol.upper() in self.cache_most_recent_link['Ticker'].values):
-                    most_recent_link = self.most_recent_link_all_df.loc[self.most_recent_link_all_df['Ticker'] == node.symbol.upper(), 'News URL'].values[0]
-                    cached_link = self.cache_most_recent_link.loc[self.cache_most_recent_link['Ticker'] == node.symbol.upper(), 'News URL'].values[0]
+                    most_recent_link = self.most_recent_link_all_df.loc[self.most_recent_link_all_df['Ticker'] == node.symbol.upper(), 'News_URL'].values[0]
+                    cached_link = self.cache_most_recent_link.loc[self.cache_most_recent_link['Ticker'] == node.symbol.upper(), 'News_URL'].values[0]
                     if self._compare_most_recent_link(node.symbol):
                         node.skip = True
                     else:
@@ -147,52 +157,144 @@ class Controller:
         return symbol.lower() in self._get_tables()
     
     def store_symbol_news(self, symbols: list[str]):
-        block = False
-        if len(symbols) > 1:
-            block = True
-        for symbol in tqdm.tqdm(symbols):
-            #TODO Make a more effecient approach. This is a quick fix.
-            skip = False
-            with self.q.mutex:
-                for node in self.q.queue:
-                    if (node.symbol.upper() == symbol.upper()) and (node.skip == True):
-                        skip = True
-                        break
-            if skip:
-                continue
-            if self._get_table_exists(symbol):
-                stored_df = pd.read_sql(f"SELECT * FROM `{symbol}` limit 100", con=self.engine)
+        #*The logic for skipping symbols and counting headlines may cause some headlines to be missed.
+        symbols = list(symbols or [])
+        if len(symbols) == 0:
+            return
+
+        # Remove skipped symbols before calling the API.
+        with self.q.mutex:
+            skipped = {node.symbol.upper() for node in self.q.queue if node.skip is True}
+        symbols_to_request = [s for s in symbols if str(s).upper() not in skipped]
+        if len(symbols_to_request) == 0:
+            return
+
+        # One finviz API call for the whole batch (API returns max 100 rows total).
+        importer = FinvizNewsImporter(url="stock_news", symbol=symbols_to_request)
+        results = importer.import_finviz_news()
+        results["Date"] = pd.to_datetime(results["Date"], errors="coerce")
+
+        for symbol in tqdm.tqdm(symbols_to_request):
+            symbol_u = symbol.upper()
+            symbol_l = symbol.lower()
+
+            if self._get_table_exists(symbol_l):
+                stored_df = pd.read_sql(f"SELECT * FROM `{symbol_l}` limit 300", con=self.engine)
             else:
-                self._ensure_symbol_news_table(symbol)
-                stored_df = pd.read_sql(f"SELECT * FROM `{symbol}` limit 100", con=self.engine)
-            importer = FinvizNewsImporter(url="stock_news", symbol=symbol)
-            results = importer.import_finviz_news()
-            results['Date'] = pd.to_datetime(results['Date'])
-            daily_results = len(results.loc[results['Date'] > datetime.now() - timedelta(days=1)])
+                self._ensure_symbol_news_table(symbol_l)
+                stored_df = pd.read_sql(f"SELECT * FROM `{symbol_l}` limit 300", con=self.engine)
+
+            symbol_results = results.loc[results["Ticker"] == symbol_u]
+
+            daily_results = len(symbol_results.loc[symbol_results["Date"] > datetime.now() - timedelta(days=1)])
             with self.q.mutex:
                 for node in self.q.queue:
-                    if node.symbol.upper() == symbol.upper():
-                        node.headline_count = daily_results
+                    if node.symbol.upper() == symbol_u:
+                        node.headline_count = daily_results if daily_results < 100 else 100
+                        if node.headline_count == 0:
+                            node.headline_count = 1
                         break
-            self.q.save_pickle()
+
             results_todb = (
-                results.loc[(results['Ticker'] == symbol.upper()) &
-                            (~results['Url'].isin(stored_df['Url'].values))]
+                symbol_results.loc[
+                    ((~symbol_results["Url"].isin(stored_df["Url"].values)) &
+                     (~symbol_results["Title"].isin(stored_df["Title"].values)))
+                ]
             )
             if len(results_todb) > 0:
-                results_todb.to_sql(f"{symbol.lower()}", con=self.engine, if_exists='append', index=False)
-                
-            # Update internal cache ("most recent link stored internally") AFTER storing
+                results_todb.to_sql(symbol_l, con=self.engine, if_exists="append", index=False)
+                if len(self.most_recent_updates) >= 100:
+                    self.most_recent_updates.remove(self.most_recent_updates[0])
+                    self.most_recent_updates.append(symbol)
+                else:
+                    self.most_recent_updates.append(symbol)
+
             if self.most_recent_link_all_df is None:
                 self._most_recent_link_all()
 
-            if symbol.upper() in self.most_recent_link_all_df["Ticker"].values:
+            if symbol_u in self.most_recent_link_all_df["Ticker"].values:
                 latest_external_link = self.most_recent_link_all_df.loc[
-                    self.most_recent_link_all_df["Ticker"] == symbol.upper(), "News URL"
+                    self.most_recent_link_all_df["Ticker"] == symbol_u, "News_URL"
                 ].values[0]
-                self._update_most_recent_link_cached(symbol, latest_external_link)                
+                self._update_most_recent_link_cached(symbol, latest_external_link)
+            
+        with open(Path(__file__).resolve().with_name('most_recent_updates.txt'), 'w') as f:
+            for update in self.most_recent_updates:
+                f.write(update + '\n')
 
-            if block:
+        # Always persist queue to repo-root pickle.
+        self._save_queue()
+
+        # If some nodes were encountered but couldn't fit in the remaining budget during
+        # traversal, fetch them individually after the batch completes.
+        budget_skipped = list(getattr(self.q, "budget_skipped_symbols", set()))
+        if hasattr(self.q, "budget_skipped_symbols"):
+            self.q.budget_skipped_symbols.clear()
+
+        # Respect API rate limit between requests.
+        time.sleep(5)
+
+        if len(budget_skipped) > 0:#* Was < 200. I changed it because each symbol is iterated over once & rate limits are respected. There shouldn't be that many budget skipped so didn't make sense. I haven't seen near that many budget skipped.
+            for symbol in tqdm.tqdm(budget_skipped):
+                symbol = str(symbol)
+                symbol_u = symbol.upper()
+                symbol_l = symbol.lower()
+
+                # Skip if the node became skippable (best-effort).
+                with self.q.mutex:
+                    if any((n.symbol.upper() == symbol_u and n.skip is True) for n in self.q.queue):
+                        continue
+
+                importer = FinvizNewsImporter(url="stock_news", symbol=symbol)
+                single_results = importer.import_finviz_news()
+                single_results["Date"] = pd.to_datetime(single_results["Date"], errors="coerce")
+
+                if self._get_table_exists(symbol_l):
+                    stored_df = pd.read_sql(f"SELECT * FROM `{symbol_l}` limit 300", con=self.engine)
+                else:
+                    self._ensure_symbol_news_table(symbol_l)
+                    stored_df = pd.read_sql(f"SELECT * FROM `{symbol_l}` limit 300", con=self.engine)
+
+                symbol_results = single_results.loc[single_results["Ticker"] == symbol_u]
+
+                daily_results = len(symbol_results.loc[symbol_results["Date"] > datetime.now() - timedelta(days=1)])
+                with self.q.mutex:
+                    for node in self.q.queue:
+                        if node.symbol.upper() == symbol_u:
+                            node.headline_count = daily_results if daily_results < 100 else 100
+                            if node.headline_count == 0:
+                                node.headline_count = 1
+                            break
+
+                results_todb = (
+                    symbol_results.loc[
+                        ((~symbol_results["Url"].isin(stored_df["Url"].values)) |
+                        (~symbol_results["Title"].isin(stored_df["Title"].values)))
+                    ]
+                )
+                if len(results_todb) > 0:
+                    results_todb.to_sql(symbol_l, con=self.engine, if_exists="append", index=False)
+                    if len(self.most_recent_updates) >= 100:
+                        self.most_recent_updates.remove(self.most_recent_updates[0])
+                        self.most_recent_updates.append(symbol)
+                    else:
+                        self.most_recent_updates.append(symbol)
+
+                if self.most_recent_link_all_df is None:
+                    self._most_recent_link_all()
+
+                if symbol_u in self.most_recent_link_all_df["Ticker"].values:
+                    latest_external_link = self.most_recent_link_all_df.loc[
+                        self.most_recent_link_all_df["Ticker"] == symbol_u, "News_URL"
+                    ].values[0]
+                    self._update_most_recent_link_cached(symbol, latest_external_link)
+                    
+                with open(Path(__file__).resolve().with_name('most_recent_updates.txt'), 'w') as f:
+                    for update in self.most_recent_updates:
+                        f.write(update + '\n')
+
+                # Always persist queue to repo-root pickle.
+                self._save_queue()
                 time.sleep(5)
 
 
@@ -221,11 +323,11 @@ class NewsQueue(queue.Queue):
       while non-eligible nodes are rotated to the back to allow scanning.
     """
 
-    def __init__(self, maxsize: int = 0, threshold: int = 95) -> None:
+    def __init__(self, maxsize: int = 0, threshold: int = 90) -> None:
         """
         Args:
             maxsize: passed through to queue.Queue
-            threshold: headline budget reset threshold, default is 95 (between 90 and 100)
+            threshold: headline budget threshold, default is 90 (between 90 and 100)
         """
         if not (90 <= threshold <= 100):
             raise ValueError("threshold must be between 90 and 100 (inclusive).")
@@ -235,6 +337,8 @@ class NewsQueue(queue.Queue):
         self.iteration_headline_sum: int = 0
         # Internal container used by traverse() to stage removed symbols.
         self._staged_symbols: List[str] = []
+        # Symbols encountered but not selected because they exceeded remaining budget.
+        self.budget_skipped_symbols: set[str] = set()
         self.threshold: int = threshold
 
     def is_empty(self) -> bool:
@@ -282,9 +386,10 @@ class NewsQueue(queue.Queue):
 
         # This attribute is "during a traversal", so reset at the start of each call.
         self.iteration_headline_sum = 0
+        self.budget_skipped_symbols.clear()
 
         if self.is_empty():
-            return ValueError("Queue is empty")
+            return []
         
         remaining = budget_threshold - self.iteration_headline_sum
         while remaining > 5:
@@ -331,6 +436,11 @@ class NewsQueue(queue.Queue):
             for _ in range(n):
                 node: NewsNode = self.queue.popleft()
                 if node.skip == True:
+                    self.queue.append(node)
+                    continue
+                # Track nodes rejected due to current remaining-budget constraints.
+                if node.headline_count >= max_headline_count:
+                    self.budget_skipped_symbols.add(node.symbol)
                     self.queue.append(node)
                     continue
                 if node.headline_count < max_headline_count:
