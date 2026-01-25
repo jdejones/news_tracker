@@ -35,7 +35,7 @@ from tkinter import ttk
 # Optional: real in-app browser (Chromium) using PyQt6 WebEngine.
 # We keep the GUI in Tkinter but embed a Qt widget for robust, JS-capable page rendering.
 try:
-    from PyQt6.QtCore import QUrl, Qt
+    from PyQt6.QtCore import QUrl, Qt, QEventLoop
     from PyQt6.QtGui import QColor
     from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -44,6 +44,7 @@ try:
 except Exception:
     QUrl = None  # type: ignore[assignment]
     Qt = None  # type: ignore[assignment]
+    QEventLoop = None  # type: ignore[assignment]
     QColor = None  # type: ignore[assignment]
     QApplication = None  # type: ignore[assignment]
     QWidget = None  # type: ignore[assignment]
@@ -210,6 +211,16 @@ class NewsHeadlinePosterApp:
         self._qt_overlay_hwnd: int | None = None
         self._qt_web: "QWebEngineView | None" = None
         self._qt_web_hwnd: int | None = None
+
+        # Tk<->Qt integration safety:
+        # - stop all periodic Tk `after()` loops during shutdown
+        # - prevent re-entrant Qt event pumping (can hard-crash QtWebEngine)
+        self._closing = False
+        self._in_qt_pump = False
+        self._qt_pump_after_id: str | None = None
+        self._browser_addr_after_id: str | None = None
+        self._browser_css_after_id: str | None = None
+        self._updates_after_id: str | None = None
 
         self._updates_file_path = os.path.join(_PROJECT_ROOT, "most_recent_updates.txt")
         self._updates_file_last_mtime: float | None = None
@@ -552,8 +563,63 @@ class NewsHeadlinePosterApp:
         self.root.update_idletasks()
 
     def _on_close(self) -> None:
-        # Best-effort cleanup for the embedded Qt widget.
+        # Best-effort cleanup for the embedded Qt widget + periodic Tk timers.
+        self._closing = True
+
+        # Cancel periodic Tk callbacks first (prevents callbacks firing during teardown).
         try:
+            for attr in ("_qt_pump_after_id", "_browser_addr_after_id", "_browser_css_after_id", "_updates_after_id"):
+                aid = getattr(self, attr, None)
+                if aid:
+                    try:
+                        self.root.after_cancel(aid)
+                    except Exception:
+                        pass
+                    try:
+                        setattr(self, attr, None)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            # Close the Qt widgets explicitly. Dropping Python refs alone can leave
+            # QtWebEngine threads running briefly, which is a common source of hard crashes.
+            try:
+                if self._qt_web is not None and _HAVE_QT_WEBENGINE:
+                    try:
+                        self._qt_web.setUrl(QUrl("about:blank"))  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+                    try:
+                        self._qt_web.close()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                    try:
+                        self._qt_web.deleteLater()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            try:
+                if self._qt_overlay is not None:
+                    try:
+                        self._qt_overlay.hide()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                    try:
+                        self._qt_overlay.close()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                    try:
+                        self._qt_overlay.deleteLater()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Drop handles/refs last.
             self._qt_overlay = None
             self._qt_overlay_hwnd = None
             self._qt_web = None
@@ -609,13 +675,51 @@ class NewsHeadlinePosterApp:
         return _QT_APP
 
     def _pump_qt_events(self) -> None:
-        app = self._ensure_qt_app()
-        if app is not None:
+        # This function must be extremely defensive. If it runs during/after teardown,
+        # or re-enters while Tk is handling a clipboard/paste event, QtWebEngine can
+        # hard-crash the interpreter.
+        try:
+            if self._closing:
+                return
             try:
-                app.processEvents()  # type: ignore[misc]
+                if not bool(self.root.winfo_exists()):
+                    return
+            except Exception:
+                # If we can't query existence, err on the side of not pumping.
+                return
+
+            # If the main Tk window is minimized, avoid driving QtWebEngine.
+            # (Some Windows/QtWebEngine builds are unstable when minimized/hidden.)
+            try:
+                if str(self.root.state()).lower() == "iconic":
+                    return
             except Exception:
                 pass
-        self.root.after(10, self._pump_qt_events)
+
+            if self._in_qt_pump:
+                return
+            self._in_qt_pump = True
+            try:
+                app = self._ensure_qt_app()
+                if app is not None:
+                    try:
+                        if QEventLoop is not None:
+                            # Limit how long Qt can run inside a single Tk callback.
+                            app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 5)  # type: ignore[misc]
+                        else:
+                            app.processEvents()  # type: ignore[misc]
+                    except Exception:
+                        pass
+            finally:
+                self._in_qt_pump = False
+        finally:
+            # Re-schedule (best-effort) while the app is alive.
+            try:
+                if not self._closing:
+                    # 40 Hz is plenty for UI responsiveness and reduces re-entrancy risk.
+                    self._qt_pump_after_id = self.root.after(25, self._pump_qt_events)
+            except Exception:
+                self._qt_pump_after_id = None
 
     def _init_internal_browser(self) -> None:
         if not _HAVE_QT_WEBENGINE:
@@ -724,6 +828,8 @@ class NewsHeadlinePosterApp:
 
     def _hide_qt_overlay(self) -> None:
         try:
+            if self._closing:
+                return
             if self._qt_overlay is not None:
                 try:
                     self._qt_overlay.hide()  # type: ignore[union-attr]
@@ -737,6 +843,8 @@ class NewsHeadlinePosterApp:
 
     def _show_qt_overlay(self) -> None:
         try:
+            if self._closing:
+                return
             # Defer to the resize logic (it applies min-size hide logic too).
             self._resize_embedded_browser()
         except Exception:
@@ -771,9 +879,10 @@ class NewsHeadlinePosterApp:
             pass
         # 4 Hz is plenty for a status/address bar.
         try:
-            self.root.after(250, self._schedule_browser_addr_sync)
+            if not self._closing:
+                self._browser_addr_after_id = self.root.after(250, self._schedule_browser_addr_sync)
         except Exception:
-            pass
+            self._browser_addr_after_id = None
 
     def _schedule_apply_browser_chrome_fix(self) -> None:
         """
@@ -785,12 +894,23 @@ class NewsHeadlinePosterApp:
         except Exception:
             pass
         try:
-            # Re-apply periodically; some navigations replace the document quickly.
-            self.root.after(500, self._schedule_apply_browser_chrome_fix)
+            if not self._closing:
+                # Re-apply periodically; some navigations replace the document quickly.
+                self._browser_css_after_id = self.root.after(500, self._schedule_apply_browser_chrome_fix)
         except Exception:
-            pass
+            self._browser_css_after_id = None
 
     def _apply_browser_css(self) -> None:
+        try:
+            if self._closing:
+                return
+        except Exception:
+            pass
+        try:
+            if str(self.root.state()).lower() == "iconic":
+                return
+        except Exception:
+            pass
         if self._qt_web is None or not _HAVE_QT_WEBENGINE:
             return
         js = r"""
@@ -960,7 +1080,11 @@ class NewsHeadlinePosterApp:
     def _schedule_updates_refresh(self) -> None:
         self._refresh_updates_box()
         # Keep it current without user interaction.
-        self.root.after(3000, self._schedule_updates_refresh)
+        try:
+            if not self._closing:
+                self._updates_after_id = self.root.after(3000, self._schedule_updates_refresh)
+        except Exception:
+            self._updates_after_id = None
 
     def _symbol_from_updates_click(self, event: tk.Event) -> str | None:
         """
@@ -1370,36 +1494,36 @@ class NewsHeadlinePosterApp:
         """
         # Preferred: pull selection directly from the embedded QWebEngineView (real browser).
         if self._qt_web is not None and _HAVE_QT_WEBENGINE:
+            # IMPORTANT: avoid Qt callbacks into Python (can hard-crash in some WebEngine builds).
             self.ai_copy_in_btn.configure(state="disabled")
-
-            def _finish(selected: Any) -> None:
-                self.ai_copy_in_btn.configure(state="normal")
-                copied = ("" if selected is None else str(selected)).strip()
-                if not copied:
-                    # Fall back to clipboard (e.g., if user used Ctrl+C in the browser).
-                    try:
-                        copied = str(self.root.clipboard_get() or "").strip()
-                    except Exception:
-                        copied = ""
-
-                if not copied:
-                    messagebox.showinfo("No text", "Highlight text in the Browser panel first.")
-                    return
-
-                self.ai_input_text.delete("1.0", "end")
-                self.ai_input_text.insert("1.0", copied)
-                self._set_status("Copied text into A.I. input.")
-
+            copied = ""
             try:
-                # Using JS avoids API differences across PyQt6 versions.
-                self._qt_web.page().runJavaScript(  # type: ignore[union-attr]
-                    "window.getSelection().toString()",
-                    lambda s: self.root.after(0, lambda: _finish(s)),
-                )
-                return
+                page = self._qt_web.page()  # type: ignore[union-attr]
+                if hasattr(page, "selectedText"):
+                    copied = str(page.selectedText() or "")
             except Exception:
+                copied = ""
+            try:
                 self.ai_copy_in_btn.configure(state="normal")
-                # Fall through to clipboard/text fallback.
+            except Exception:
+                pass
+
+            copied = (copied or "").strip()
+            if not copied:
+                # Fall back to clipboard (e.g., if user used Ctrl+C in the browser).
+                try:
+                    copied = str(self.root.clipboard_get() or "").strip()
+                except Exception:
+                    copied = ""
+
+            if not copied:
+                messagebox.showinfo("No text", "Highlight text in the Browser panel first.")
+                return
+
+            self.ai_input_text.delete("1.0", "end")
+            self.ai_input_text.insert("1.0", copied)
+            self._set_status("Copied text into A.I. input.")
+            return
 
         copied = ""
         try:
