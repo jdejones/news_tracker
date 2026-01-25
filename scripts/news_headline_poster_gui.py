@@ -16,17 +16,43 @@ import subprocess
 import sys
 import threading
 import webbrowser
+import ctypes
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 from sqlalchemy import create_engine, inspect
 
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import messagebox
 from tkinter import ttk
+
+# Optional: real in-app browser (Chromium) using PyQt6 WebEngine.
+# We keep the GUI in Tkinter but embed a Qt widget for robust, JS-capable page rendering.
+try:
+    from PyQt6.QtCore import QUrl, Qt
+    from PyQt6.QtGui import QColor
+    from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+    _HAVE_QT_WEBENGINE = True
+except Exception:
+    QUrl = None  # type: ignore[assignment]
+    Qt = None  # type: ignore[assignment]
+    QColor = None  # type: ignore[assignment]
+    QApplication = None  # type: ignore[assignment]
+    QWidget = None  # type: ignore[assignment]
+    QVBoxLayout = None  # type: ignore[assignment]
+    QWebEngineView = None  # type: ignore[assignment]
+    _HAVE_QT_WEBENGINE = False
+
+_QT_APP: "QApplication | None" = None
+_QT_ENV_CONFIGURED = False
 
 # Allow running as: `python scripts/news_headline_poster_gui.py`
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +65,82 @@ from x import Post_Constructor, post_scheduler, scheduled_post
 
 
 NEWS_DB_URL = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
+
+
+def _apply_filings_stream_like_style(root: tk.Tk) -> None:
+    """
+    Visual-only styling to make this Tkinter GUI feel closer to `filings_stream_gui.py`:
+    - clean typography (Segoe UI)
+    - consistent padding
+    - subtle, modern Treeview look
+    """
+    # Set sensible default fonts (best-effort; falls back silently if unavailable).
+    try:
+        default_family = "Segoe UI"
+        default_size = 10
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                f = tkfont.nametofont(name)
+                f.configure(family=default_family, size=default_size)
+            except Exception:
+                pass
+        try:
+            fixed = tkfont.nametofont("TkFixedFont")
+            fixed.configure(family="Consolas", size=10)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # ttk theme + widget styling
+    try:
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            # Keep the current theme if clam isn't available.
+            pass
+
+        bg = "#f6f7f9"
+        panel_bg = "#ffffff"
+        subtle = "#444444"
+
+        try:
+            root.configure(background=bg)
+        except Exception:
+            pass
+
+        # Base
+        style.configure(".", background=bg)
+        style.configure("TFrame", background=bg)
+        style.configure("TLabel", background=bg, foreground=subtle)
+        style.configure("TButton", padding=(10, 6))
+        style.configure("TCheckbutton", background=bg, foreground=subtle)
+        style.configure("TCombobox", padding=(6, 4))
+        style.configure("TEntry", padding=(6, 4))
+
+        # Labelframe "cards"
+        style.configure("TLabelframe", background=bg)
+        style.configure("TLabelframe.Label", background=bg, foreground="#222222")
+
+        # Treeview (table)
+        style.configure(
+            "Treeview",
+            background=panel_bg,
+            fieldbackground=panel_bg,
+            foreground="#222222",
+            rowheight=24,
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure("Treeview.Heading", font=(default_family, default_size, "bold"), foreground="#222222")
+        style.map(
+            "Treeview",
+            background=[("selected", "#e8f0fe")],
+            foreground=[("selected", "#222222")],
+        )
+    except Exception:
+        pass
 
 
 @dataclass(frozen=True)
@@ -104,6 +206,10 @@ class NewsHeadlinePosterApp:
         self.root.geometry("1100x650")
 
         self.pc = Post_Constructor()
+        self._qt_overlay: "QWidget | None" = None
+        self._qt_overlay_hwnd: int | None = None
+        self._qt_web: "QWebEngineView | None" = None
+        self._qt_web_hwnd: int | None = None
 
         self._updates_file_path = os.path.join(_PROJECT_ROOT, "most_recent_updates.txt")
         self._updates_file_last_mtime: float | None = None
@@ -113,8 +219,15 @@ class NewsHeadlinePosterApp:
         self._selected_row: HeadlineRow | None = None
 
         self._build_ui()
+        self._init_internal_browser()
         self._load_symbols_async()
         self._schedule_updates_refresh()
+
+        # Ensure cleanup on close.
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        except Exception:
+            pass
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -122,6 +235,7 @@ class NewsHeadlinePosterApp:
 
         top = ttk.Frame(self.root, padding=10)
         top.grid(row=0, column=0, sticky="ew")
+        # Let the updates strip grow; keep status anchored right.
         top.columnconfigure(6, weight=1)
 
         ttk.Label(top, text="Symbol").grid(row=0, column=0, sticky="w")
@@ -143,8 +257,28 @@ class NewsHeadlinePosterApp:
         self.load_btn = ttk.Button(top, text="Load headlines", command=self.load_headlines_clicked)
         self.load_btn.grid(row=0, column=5, sticky="w")
 
+        # Most recent updates (compact, horizontal)
+        updates_strip = ttk.Frame(top)
+        updates_strip.grid(row=0, column=6, sticky="ew", padx=(10, 10))
+        updates_strip.columnconfigure(0, weight=1)
+
+        self.updates_text = tk.Text(
+            updates_strip,
+            height=1,
+            wrap="none",
+            cursor="arrow",  # keep pointer cursor (not I-beam)
+            takefocus=0,  # avoid tab-focus into a read-only log
+        )
+        self.updates_text.grid(row=0, column=0, sticky="ew")
+        self.updates_text.configure(state="disabled")
+        self.updates_text.bind("<Button-1>", self._on_updates_text_click)
+
+        updates_xscroll = ttk.Scrollbar(updates_strip, orient=tk.HORIZONTAL, command=self.updates_text.xview)
+        updates_xscroll.grid(row=1, column=0, sticky="ew")
+        self.updates_text.configure(xscrollcommand=updates_xscroll.set)
+
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(top, textvariable=self.status_var).grid(row=0, column=6, sticky="e")
+        ttk.Label(top, textvariable=self.status_var).grid(row=0, column=7, sticky="e")
 
         main = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         main.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
@@ -154,12 +288,19 @@ class NewsHeadlinePosterApp:
         main.add(left, weight=3)
         main.add(right, weight=2)
 
-        # Left: table
+        # Left: resizable split (table + browser) like QSplitter in `filings_stream_gui.py`
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1)
 
+        left_split = ttk.Panedwindow(left, orient=tk.VERTICAL)
+        left_split.grid(row=0, column=0, sticky="nsew")
+
+        table_host = ttk.Frame(left_split)
+        table_host.columnconfigure(0, weight=1)
+        table_host.rowconfigure(0, weight=1)
+
         columns = ("Date", "Title", "Source", "Category", "Url")
-        self.tree = ttk.Treeview(left, columns=columns, show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(table_host, columns=columns, show="headings", selectmode="browse")
         self.tree.grid(row=0, column=0, sticky="nsew")
 
         self.tree.heading("Date", text="Date")
@@ -174,22 +315,70 @@ class NewsHeadlinePosterApp:
         self.tree.column("Category", width=120, anchor="w", stretch=False)
         self.tree.column("Url", width=220, anchor="w", stretch=True)
 
-        yscroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tree.yview)
+        yscroll = ttk.Scrollbar(table_host, orient=tk.VERTICAL, command=self.tree.yview)
         yscroll.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=yscroll.set)
 
         self.tree.bind("<<TreeviewSelect>>", self._on_row_selected)
         self.tree.bind("<Double-1>", lambda _e: self.open_link_clicked())
 
-        # Right: preview + actions
-        right.columnconfigure(0, weight=1)
-        # Keep preview/buttons tight; put extra vertical space above the updates box.
-        right.rowconfigure(0, weight=0)
-        right.rowconfigure(1, weight=0)
-        right.rowconfigure(2, weight=1)  # spacer
-        right.rowconfigure(3, weight=0)  # updates
+        # Browser (minimal article preview) — beneath the table
+        browser = ttk.LabelFrame(left_split, text="Browser", padding=8)
+        browser.columnconfigure(0, weight=1)
+        browser.rowconfigure(2, weight=1)
 
-        preview = ttk.LabelFrame(right, text="Selection / Post Preview", padding=10)
+        # Address bar (like `filings_stream_gui.py`)
+        self.browser_addr_var = tk.StringVar(value="")
+        self.browser_url_var = tk.StringVar(value="")
+
+        browser_controls = ttk.Frame(browser)
+        browser_controls.grid(row=0, column=0, columnspan=2, sticky="ew")
+        browser_controls.columnconfigure(0, weight=1)
+
+        self.browser_addr_entry = ttk.Entry(browser_controls, textvariable=self.browser_addr_var)
+        self.browser_addr_entry.grid(row=0, column=0, sticky="ew")
+        self.browser_addr_entry.bind("<Return>", lambda _e: self.browser_go_clicked())
+
+        self.browser_go_btn = ttk.Button(browser_controls, text="Go", command=self.browser_go_clicked)
+        self.browser_go_btn.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        self.browser_open_external_btn = ttk.Button(
+            browser_controls, text="Open external", command=self.browser_open_external_clicked
+        )
+        self.browser_open_external_btn.grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+        # Subtle status line (loading/loaded/errors).
+        ttk.Label(browser, textvariable=self.browser_url_var, foreground="#444").grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        # If PyQt6 WebEngine is available, embed a real browser here.
+        # Otherwise, fall back to a simple text preview (scrape) so the app still runs.
+        if _HAVE_QT_WEBENGINE:
+            # Use a real Tk frame as the native host so we can control its background
+            # (and avoid black "gutter" artifacts around the embedded child HWND).
+            self.browser_host = tk.Frame(browser, background="#ffffff", highlightthickness=0, bd=0)
+            self.browser_host.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+            self.browser_host.bind("<Configure>", self._on_browser_host_configure)
+        else:
+            self.browser_text = tk.Text(browser, height=10, wrap="word")
+            self.browser_text.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+            browser_yscroll = ttk.Scrollbar(browser, orient=tk.VERTICAL, command=self.browser_text.yview)
+            browser_yscroll.grid(row=2, column=1, sticky="ns", pady=(8, 0))
+            self.browser_text.configure(yscrollcommand=browser_yscroll.set)
+
+        left_split.add(table_host, weight=3)
+        left_split.add(browser, weight=2)
+
+        # Right: resizable split (top controls + AI) like QSplitter in `filings_stream_gui.py`
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
+
+        right_split = ttk.Panedwindow(right, orient=tk.VERTICAL)
+        right_split.grid(row=0, column=0, sticky="nsew")
+
+        top_right = ttk.Frame(right_split)
+        top_right.columnconfigure(0, weight=1)
+
+        preview = ttk.LabelFrame(top_right, text="Selection / Post Preview", padding=10)
         preview.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         preview.columnconfigure(0, weight=1)
 
@@ -204,49 +393,531 @@ class NewsHeadlinePosterApp:
         self.preview_var = tk.StringVar(value="")
         ttk.Label(preview, textvariable=self.preview_var, foreground="#444").grid(row=2, column=0, sticky="w", pady=(8, 0))
 
-        btns = ttk.Frame(right)
+        btns = ttk.Frame(top_right)
         btns.grid(row=1, column=0, sticky="ew")
-        btns.columnconfigure(4, weight=1)
+        btns.columnconfigure(5, weight=1)
 
-        self.open_link_btn = ttk.Button(btns, text="Open link", command=self.open_link_clicked)
+        self.open_link_enabled_var = tk.BooleanVar(value=False)
+        self.open_link_btn = ttk.Checkbutton(
+            btns,
+            text="Open link",
+            variable=self.open_link_enabled_var,
+            command=self._on_open_link_toggle,
+        )
         self.open_link_btn.grid(row=0, column=0, sticky="w")
 
+        self.open_external_btn = ttk.Button(btns, text="Open external", command=self.open_external_clicked)
+        self.open_external_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+
         self.post_btn = ttk.Button(btns, text="Post to X", command=self.post_clicked)
-        self.post_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.post_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
 
         self.schedule_btn = ttk.Button(btns, text="Schedule Post", command=self.schedule_clicked)
-        self.schedule_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self.schedule_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
 
         self.view_scheduled_btn = ttk.Button(btns, text="View scheduled", command=self.view_scheduled_clicked)
-        self.view_scheduled_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        self.view_scheduled_btn.grid(row=0, column=4, sticky="w", padx=(8, 0))
 
-        self.copy_btn = ttk.Button(btns, text="Copy tweet text", command=self.copy_tweet_text_clicked)
-        self.copy_btn.grid(row=0, column=5, sticky="e")
+        self.copy_btn = ttk.Button(btns, text="Copy text", command=self.copy_tweet_text_clicked)
+        self.copy_btn.grid(row=0, column=6, sticky="e")
 
-        ttk.Frame(right).grid(row=2, column=0, sticky="nsew")
+        ai_split = ttk.Panedwindow(right_split, orient=tk.VERTICAL)
 
-        updates = ttk.LabelFrame(right, text="Most recent updates", padding=10)
-        updates.grid(row=3, column=0, sticky="sew", pady=(10, 0))
-        updates.columnconfigure(0, weight=1)
+        # AI input
+        ai_in = ttk.LabelFrame(ai_split, text="A.I. input", padding=10)
+        ai_in.columnconfigure(0, weight=1)
+        ai_in.rowconfigure(0, weight=1)
 
-        self.updates_text = tk.Text(
-            updates,
-            height=8,
-            wrap="none",
-            cursor="arrow",  # keep pointer cursor (not I-beam)
-            takefocus=0,  # avoid tab-focus into a read-only log
+        ai_in_controls = ttk.Frame(ai_in)
+        ai_in_controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ai_in_controls.columnconfigure(0, weight=1)
+
+        self.ai_copy_in_btn = ttk.Button(ai_in_controls, text="Copy text", command=self.ai_copy_input_clicked)
+        self.ai_copy_in_btn.grid(row=0, column=0, sticky="w")
+        self.ai_summarize_btn = ttk.Button(ai_in_controls, text="Summarize", command=self.ai_summarize_clicked)
+        self.ai_summarize_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        self.ai_input_text = tk.Text(ai_in, height=6, wrap="word")
+        self.ai_input_text.grid(row=0, column=0, sticky="nsew")
+
+        # AI output
+        ai_out = ttk.LabelFrame(ai_split, text="A.I. output", padding=10)
+        ai_out.columnconfigure(0, weight=1)
+        ai_out.rowconfigure(0, weight=1)
+
+        self.ai_output_text = tk.Text(ai_out, height=6, wrap="word")
+        self.ai_output_text.grid(row=0, column=0, sticky="nsew")
+
+        ai_out_controls = ttk.Frame(ai_out)
+        ai_out_controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ai_out_controls.columnconfigure(5, weight=1)
+
+        self.ai_copy_out_btn = ttk.Button(ai_out_controls, text="Copy text", command=self.ai_copy_output_clicked)
+        self.ai_copy_out_btn.grid(row=0, column=0, sticky="w")
+
+        self.ai_post_btn = ttk.Button(ai_out_controls, text="Post to X", command=self.ai_post_clicked)
+        self.ai_post_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        self.ai_schedule_btn = ttk.Button(ai_out_controls, text="Schedule Post", command=self.ai_schedule_clicked)
+        self.ai_schedule_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
+
+        self.ai_view_scheduled_btn = ttk.Button(
+            ai_out_controls,
+            text="View Scheduled",
+            command=self.view_scheduled_clicked,
         )
-        self.updates_text.grid(row=0, column=0, sticky="nsew")
-        self.updates_text.configure(state="disabled")
-        self.updates_text.bind("<Button-1>", self._on_updates_text_click)
+        self.ai_view_scheduled_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
 
-        updates_scroll = ttk.Scrollbar(updates, orient=tk.VERTICAL, command=self.updates_text.yview)
-        updates_scroll.grid(row=0, column=1, sticky="ns")
-        self.updates_text.configure(yscrollcommand=updates_scroll.set)
+        right_split.add(top_right, weight=1)
+        right_split.add(ai_split, weight=2)
+        ai_split.add(ai_in, weight=1)
+        ai_split.add(ai_out, weight=1)
+
+        # Apply initial splitter proportions (visual-only; user can drag-adjust).
+        self._main_split = main
+        self._left_split = left_split
+        self._right_split = right_split
+        self._ai_split = ai_split
+        self.root.after_idle(self._apply_default_split_sizes)
+
+        # Make text widgets match the cleaner Qt look (visual-only).
+        try:
+            text_font = ("Segoe UI", 10)
+            for w in (self.updates_text, self.title_text, self.ai_input_text, self.ai_output_text):
+                try:
+                    w.configure(
+                        font=text_font,
+                        background="#ffffff",
+                        foreground="#222222",
+                        insertbackground="#222222",
+                        selectbackground="#e8f0fe",
+                        selectforeground="#222222",
+                    )
+                except Exception:
+                    pass
+            if not _HAVE_QT_WEBENGINE:
+                try:
+                    self.browser_text.configure(
+                        font=text_font,
+                        background="#ffffff",
+                        foreground="#222222",
+                        insertbackground="#222222",
+                        selectbackground="#e8f0fe",
+                        selectforeground="#222222",
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _apply_default_split_sizes(self) -> None:
+        """
+        Visual-only: set initial sash positions for the Panedwindows to feel like
+        `filings_stream_gui.py`'s splitters (and remain user-adjustable).
+        """
+        try:
+            # Main split: ~60/40.
+            w = int(self._main_split.winfo_width())
+            if w > 200:
+                self._main_split.sashpos(0, int(w * 0.60))
+        except Exception:
+            pass
+
+        try:
+            # Left split: table gets a bit more height than browser.
+            h = int(self._left_split.winfo_height())
+            if h > 200:
+                self._left_split.sashpos(0, int(h * 0.62))
+        except Exception:
+            pass
+
+        try:
+            # Right split: keep preview/buttons smaller than AI section.
+            h = int(self._right_split.winfo_height())
+            if h > 200:
+                self._right_split.sashpos(0, int(h * 0.35))
+        except Exception:
+            pass
+
+        try:
+            # AI split: 50/50 input/output.
+            h = int(self._ai_split.winfo_height())
+            if h > 200:
+                self._ai_split.sashpos(0, int(h * 0.50))
+        except Exception:
+            pass
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
         self.root.update_idletasks()
+
+    def _on_close(self) -> None:
+        # Best-effort cleanup for the embedded Qt widget.
+        try:
+            self._qt_overlay = None
+            self._qt_overlay_hwnd = None
+            self._qt_web = None
+            self._qt_web_hwnd = None
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def _ensure_qt_app(self) -> "QApplication | None":
+        global _QT_APP
+        global _QT_ENV_CONFIGURED
+        if not _HAVE_QT_WEBENGINE:
+            return None
+        # QtWebEngine + native embedding can produce black "unpainted" regions on some Windows
+        # setups (especially with DPI scaling). Prefer safer software paths unless the user
+        # explicitly overrides via environment variables.
+        if not _QT_ENV_CONFIGURED:
+            _QT_ENV_CONFIGURED = True
+            try:
+                os.environ.setdefault("QT_OPENGL", "software")
+            except Exception:
+                pass
+            try:
+                existing = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+                flags = existing.split() if existing else []
+                # Add only if not already present.
+                for f in (
+                    "--disable-gpu",
+                    "--disable-gpu-compositing",
+                    "--disable-features=VizDisplayCompositor",
+                ):
+                    if f not in flags:
+                        flags.append(f)
+                os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(flags).strip()
+            except Exception:
+                pass
+        try:
+            existing = QApplication.instance()  # type: ignore[misc]
+        except Exception:
+            existing = None
+        if existing is not None:
+            _QT_APP = existing
+            return _QT_APP
+        if _QT_APP is None:
+            # Create a QApplication without taking over the main loop;
+            # we pump events via Tk's `after()`.
+            # IMPORTANT: Qt expects argv to contain a program name. An empty list can
+            # trigger: "Argument list is empty, the program name is not passed..."
+            _QT_APP = QApplication(sys.argv or ["news_headline_poster_gui"])  # type: ignore[call-arg]
+        return _QT_APP
+
+    def _pump_qt_events(self) -> None:
+        app = self._ensure_qt_app()
+        if app is not None:
+            try:
+                app.processEvents()  # type: ignore[misc]
+            except Exception:
+                pass
+        self.root.after(10, self._pump_qt_events)
+
+    def _init_internal_browser(self) -> None:
+        if not _HAVE_QT_WEBENGINE:
+            self.browser_url_var.set("Browser fallback mode (no PyQt6-WebEngine): will scrape page text.")
+            return
+
+        app = self._ensure_qt_app()
+        if app is None:
+            return
+
+        try:
+            # Create a dedicated frameless overlay window and host the webview inside it.
+            overlay = QWidget()  # type: ignore[call-arg]
+            try:
+                if Qt is not None:
+                    overlay.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)  # type: ignore[union-attr]
+            except Exception:
+                pass
+            try:
+                overlay.setWindowTitle("")  # avoid a visible title if the OS draws one
+            except Exception:
+                pass
+            try:
+                overlay.setStyleSheet("background: #ffffff;")
+            except Exception:
+                pass
+
+            layout = QVBoxLayout(overlay)  # type: ignore[call-arg]
+            try:
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.setSpacing(0)
+            except Exception:
+                pass
+
+            web = QWebEngineView(overlay)  # type: ignore[call-arg]
+            web.setUrl(QUrl("about:blank"))  # type: ignore[arg-type]
+            # Help avoid unpainted "black gutters" when embedded in a non-Qt host:
+            # force an opaque, white background.
+            try:
+                if Qt is not None:
+                    web.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)  # type: ignore[union-attr]
+            except Exception:
+                pass
+            try:
+                web.setStyleSheet("background: #ffffff;")
+            except Exception:
+                pass
+            try:
+                if QColor is not None:
+                    web.page().setBackgroundColor(QColor("#ffffff"))  # type: ignore[union-attr]
+            except Exception:
+                pass
+            try:
+                layout.addWidget(web)
+            except Exception:
+                pass
+
+            # Force native handle creation.
+            overlay.show()
+            web.show()
+
+            self._qt_overlay = overlay
+            try:
+                self._qt_overlay_hwnd = int(overlay.winId())
+            except Exception:
+                self._qt_overlay_hwnd = None
+
+            self._qt_web = web
+            try:
+                self._qt_web_hwnd = int(web.winId())
+            except Exception:
+                self._qt_web_hwnd = None
+
+            # Make the overlay owned by the Tk root so it stays above the app and minimizes with it.
+            try:
+                GWLP_HWNDPARENT = -8
+                root_hwnd = int(self.root.winfo_id())
+                try:
+                    ctypes.windll.user32.SetWindowLongPtrW(self._qt_overlay_hwnd, GWLP_HWNDPARENT, root_hwnd)
+                except Exception:
+                    ctypes.windll.user32.SetWindowLongW(self._qt_overlay_hwnd, GWLP_HWNDPARENT, root_hwnd)
+            except Exception:
+                pass
+
+            # Size it correctly immediately.
+            self._resize_embedded_browser()
+
+            # Start pumping Qt events.
+            self._pump_qt_events()
+            self._schedule_browser_addr_sync()
+            self._schedule_apply_browser_chrome_fix()
+
+            # Track Tk window moves/minimize to keep the overlay aligned.
+            try:
+                self.root.bind("<Configure>", lambda _e: self._resize_embedded_browser())
+                self.root.bind("<Unmap>", lambda _e: self._hide_qt_overlay())
+                self.root.bind("<Map>", lambda _e: self._show_qt_overlay())
+            except Exception:
+                pass
+        except Exception as e:
+            self.browser_url_var.set(f"Browser init failed (fallback mode): {e}")
+            self._qt_overlay = None
+            self._qt_overlay_hwnd = None
+            self._qt_web = None
+            self._qt_web_hwnd = None
+
+    def _hide_qt_overlay(self) -> None:
+        try:
+            if self._qt_overlay is not None:
+                try:
+                    self._qt_overlay.hide()  # type: ignore[union-attr]
+                    return
+                except Exception:
+                    pass
+            if self._qt_overlay_hwnd:
+                ctypes.windll.user32.ShowWindow(self._qt_overlay_hwnd, 0)  # SW_HIDE
+        except Exception:
+            pass
+
+    def _show_qt_overlay(self) -> None:
+        try:
+            # Defer to the resize logic (it applies min-size hide logic too).
+            self._resize_embedded_browser()
+        except Exception:
+            pass
+
+    def _schedule_browser_addr_sync(self) -> None:
+        """
+        Keep the address bar synced without Qt→Python callbacks.
+        This avoids rare hard-crashes from QtWebEngine emitting signals on non-Python threads.
+        """
+        try:
+            if self._qt_web is not None and _HAVE_QT_WEBENGINE:
+                try:
+                    s = str(self._qt_web.url().toString() or "").strip()  # type: ignore[union-attr]
+                except Exception:
+                    s = ""
+                if s:
+                    try:
+                        # Don't clobber user typing/pasting in the address bar.
+                        editing = False
+                        try:
+                            if hasattr(self, "browser_addr_entry"):
+                                editing = (self.root.focus_get() == self.browser_addr_entry)
+                        except Exception:
+                            editing = False
+
+                        if (not editing) and hasattr(self, "browser_addr_var") and (self.browser_addr_var.get() != s):
+                            self.browser_addr_var.set(s)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # 4 Hz is plenty for a status/address bar.
+        try:
+            self.root.after(250, self._schedule_browser_addr_sync)
+        except Exception:
+            pass
+
+    def _schedule_apply_browser_chrome_fix(self) -> None:
+        """
+        Visual-only: apply CSS that fixes scrollbar/corner "gutter" artifacts that can
+        appear as black rectangles when QWebEngineView is embedded as a native child window.
+        """
+        try:
+            self._apply_browser_css()
+        except Exception:
+            pass
+        try:
+            # Re-apply periodically; some navigations replace the document quickly.
+            self.root.after(500, self._schedule_apply_browser_chrome_fix)
+        except Exception:
+            pass
+
+    def _apply_browser_css(self) -> None:
+        if self._qt_web is None or not _HAVE_QT_WEBENGINE:
+            return
+        js = r"""
+        (function () {
+          try {
+            const id = "newsTrackerScrollbarStyle";
+            let el = document.getElementById(id);
+            if (!el) {
+              el = document.createElement("style");
+              el.id = id;
+              (document.head || document.documentElement).appendChild(el);
+            }
+            el.textContent = `
+              html, body { background: #ffffff !important; }
+              /* Force scrollbar track/corner to a light neutral (prevents black gutter blocks). */
+              ::-webkit-scrollbar { width: 12px; height: 12px; }
+              ::-webkit-scrollbar-track { background: #f1f3f4; }
+              ::-webkit-scrollbar-thumb {
+                background: #c1c1c1;
+                border-radius: 8px;
+                border: 3px solid #f1f3f4;
+              }
+              ::-webkit-scrollbar-thumb:hover { background: #a8a8a8; }
+              ::-webkit-scrollbar-corner { background: #f1f3f4; }
+            `;
+          } catch (e) { /* ignore */ }
+        })();
+        """
+        try:
+            self._qt_web.page().runJavaScript(js)  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+    def _on_browser_host_configure(self, _event: tk.Event) -> None:
+        self._resize_embedded_browser()
+
+    def _resize_embedded_browser(self) -> None:
+        if self._qt_overlay is None or self._qt_overlay_hwnd is None or self._qt_web is None:
+            return
+        try:
+            # Overlay mode: position the borderless Qt window over the Tk host frame using
+            # the host HWND's *screen* rectangle (physical pixels), then translate to Qt's
+            # logical coordinates using the screen devicePixelRatio (important at 125% DPI).
+            host_hwnd = int(self.browser_host.winfo_id())
+
+            class _RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long),
+                    ("top", ctypes.c_long),
+                    ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long),
+                ]
+
+            rect = _RECT()
+            ok = ctypes.windll.user32.GetWindowRect(host_hwnd, ctypes.byref(rect))
+            if not ok:
+                # Fall back to Tk coords if needed.
+                x = int(self.browser_host.winfo_rootx())
+                y = int(self.browser_host.winfo_rooty())
+                w = int(self.browser_host.winfo_width())
+                h = int(self.browser_host.winfo_height())
+            else:
+                x = int(rect.left)
+                y = int(rect.top)
+                w = int(rect.right - rect.left)
+                h = int(rect.bottom - rect.top)
+            if w <= 1 or h <= 1:
+                return
+            # If the pane is made extremely small, QtWebEngine can become unstable when embedded.
+            # Hide the child window below a minimum size to avoid crashes.
+            try:
+                SW_HIDE = 0
+                SW_SHOWNOACTIVATE = 4
+                if w < 120 or h < 90:
+                    try:
+                        self._qt_overlay.hide()  # type: ignore[union-attr]
+                    except Exception:
+                        ctypes.windll.user32.ShowWindow(self._qt_overlay_hwnd, SW_HIDE)
+                    return
+                try:
+                    self._qt_overlay.show()  # type: ignore[union-attr]
+                except Exception:
+                    ctypes.windll.user32.ShowWindow(self._qt_overlay_hwnd, SW_SHOWNOACTIVATE)
+            except Exception:
+                pass
+            # Prefer Qt geometry changes (keeps QtWebEngine painting stable).
+            dpr = 1.0
+            try:
+                app = self._ensure_qt_app()
+                if app is not None:
+                    try:
+                        scr = app.primaryScreen()  # type: ignore[union-attr]
+                        if scr is not None:
+                            dpr = float(getattr(scr, "devicePixelRatio", lambda: 1.0)() or 1.0)
+                    except Exception:
+                        dpr = 1.0
+            except Exception:
+                dpr = 1.0
+
+            x_q = int(x / dpr)
+            y_q = int(y / dpr)
+            w_q = max(int(w / dpr), 1)
+            h_q = max(int(h / dpr), 1)
+            try:
+                self._qt_overlay.setGeometry(x_q, y_q, w_q, h_q)  # type: ignore[union-attr]
+                try:
+                    self._qt_overlay.raise_()  # type: ignore[union-attr]
+                except Exception:
+                    pass
+            except Exception:
+                # Last-resort: direct Win32 move.
+                ctypes.windll.user32.MoveWindow(self._qt_overlay_hwnd, x, y, w, h, True)
+            # Force a redraw of the native child window to prevent leftover artifacts.
+            try:
+                RDW_INVALIDATE = 0x0001
+                RDW_UPDATENOW = 0x0100
+                RDW_ALLCHILDREN = 0x0080
+                ctypes.windll.user32.RedrawWindow(
+                    self._qt_overlay_hwnd,
+                    None,
+                    None,
+                    RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _read_updates_file_reversed(self) -> str:
         try:
@@ -266,7 +937,8 @@ class NewsHeadlinePosterApp:
                 lines = [ln.rstrip("\n") for ln in f.readlines()]
             # Reverse order (newest at top).
             lines = list(reversed([ln for ln in lines if ln.strip() != ""]))
-            return "\n".join(lines) if lines else "(No updates yet)"
+            # Compact single-line display with horizontal scroll.
+            return "  ".join(lines) if lines else "(No updates yet)"
         except Exception as e:
             return f"(Could not read updates)\n{e}"
 
@@ -399,6 +1071,12 @@ class NewsHeadlinePosterApp:
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self._clear_preview()
+        self._clear_browser()
+        try:
+            self.ai_input_text.delete("1.0", "end")
+            self.ai_output_text.delete("1.0", "end")
+        except Exception:
+            pass
 
         self.load_btn.configure(state="disabled")
         self._set_status(f"Loading headlines for {symbol.upper()}…")
@@ -481,6 +1159,7 @@ class NewsHeadlinePosterApp:
             return
         self._selected_row = row
         self._update_preview()
+        self._maybe_open_link_in_browser()
 
     def _tweet_text_for_selection(self) -> str:
         if not self._selected_row or not self._selected_symbol:
@@ -515,11 +1194,357 @@ class NewsHeadlinePosterApp:
         self._update_length_indicator()
 
     def open_link_clicked(self) -> None:
+        # Only load into the embedded browser if Open link is enabled.
+        if not bool(self.open_link_enabled_var.get()):
+            return
+        url = (self.link_var.get() or "").strip()
+        if not url:
+            messagebox.showinfo("No link", "No link to open. Select a row or paste a link.")
+            return
+        self._load_browser_url(url)
+
+    def open_external_clicked(self) -> None:
         url = (self.link_var.get() or "").strip()
         if not url:
             messagebox.showinfo("No link", "No link to open. Select a row or paste a link.")
             return
         webbrowser.open(url)
+
+    def _on_open_link_toggle(self) -> None:
+        # If the user just enabled it, immediately load whatever URL is present.
+        if bool(self.open_link_enabled_var.get()):
+            self._maybe_open_link_in_browser()
+
+    def _maybe_open_link_in_browser(self) -> None:
+        if not bool(self.open_link_enabled_var.get()):
+            return
+        url = (self.link_var.get() or "").strip()
+        if not url:
+            return
+        self._load_browser_url(url)
+
+    def _clear_browser(self) -> None:
+        self.browser_url_var.set("")
+        try:
+            if hasattr(self, "browser_addr_var"):
+                self.browser_addr_var.set("")
+        except Exception:
+            pass
+        try:
+            if self._qt_web is not None and _HAVE_QT_WEBENGINE:
+                self._qt_web.setUrl(QUrl("about:blank"))  # type: ignore[arg-type]
+            else:
+                self.browser_text.delete("1.0", "end")
+        except Exception:
+            pass
+
+    def browser_go_clicked(self) -> None:
+        raw = ""
+        try:
+            raw = (self.browser_addr_var.get() or "").strip()
+        except Exception:
+            raw = ""
+        if not raw:
+            return
+        self._load_browser_url(raw)
+
+    def browser_open_external_clicked(self) -> None:
+        raw = ""
+        try:
+            raw = (self.browser_addr_var.get() or "").strip()
+        except Exception:
+            raw = ""
+        if not raw:
+            # Fall back to the selection URL.
+            raw = (self.link_var.get() or "").strip()
+        if not raw:
+            messagebox.showinfo("No link", "No URL to open.")
+            return
+        webbrowser.open(self._normalize_browser_url(raw))
+
+    def _load_browser_url(self, url: str) -> None:
+        raw_in = (url or "").strip()
+        if not raw_in:
+            return
+        raw = self._normalize_browser_url(raw_in)
+        try:
+            if hasattr(self, "browser_addr_var"):
+                self.browser_addr_var.set(raw)
+        except Exception:
+            pass
+
+        # Preferred: real embedded browser (handles JS-heavy sites).
+        if self._qt_web is not None and _HAVE_QT_WEBENGINE:
+            try:
+                self.browser_url_var.set(f"Loading: {raw}")
+                try:
+                    # More robust than QUrl(raw): adds scheme, handles spaces, etc.
+                    qurl = QUrl.fromUserInput(raw)  # type: ignore[union-attr]
+                except Exception:
+                    qurl = QUrl(raw)  # type: ignore[arg-type]
+                self._qt_web.setUrl(qurl)  # type: ignore[arg-type]
+                # Apply visual CSS once the page is likely present.
+                try:
+                    self.root.after(750, self._apply_browser_css)
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                # Fall back to scrape if Qt fails unexpectedly.
+                self.browser_url_var.set(f"Browser error (fallback): {e}")
+
+        # Fallback: scrape page text into a Tk Text widget (best-effort).
+        self.browser_url_var.set(f"Loading (fallback): {raw}")
+
+        def worker() -> None:
+            try:
+                text = self._fetch_article_text_fallback(raw)
+            except Exception as e:
+                self.root.after(0, lambda: self._on_browser_fallback_error(raw, e))
+                return
+            self.root.after(0, lambda: self._on_browser_fallback_done(raw, text))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _normalize_browser_url(self, raw: str) -> str:
+        """
+        Normalize user-entered URLs so both QtWebEngine and requests() can load them.
+        Examples:
+        - "finviz.com" -> "https://finviz.com"
+        - "www.cnn.com" -> "https://www.cnn.com"
+        - "//example.com" -> "https://example.com"
+        """
+        s = (raw or "").strip()
+        if not s:
+            return ""
+        lower = s.lower()
+        # Leave special/internal schemes untouched.
+        if lower.startswith(("http://", "https://", "file://", "about:", "chrome:", "edge:", "view-source:")):
+            return s
+        if s.startswith("//"):
+            return "https:" + s
+        # If the user typed a bare host/path, assume https.
+        return "https://" + s
+
+    def _fetch_article_text_fallback(self, url: str) -> str:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NewsTracker/1.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+
+        html = resp.text or ""
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript", "header", "footer", "svg"]):
+            try:
+                tag.decompose()
+            except Exception:
+                pass
+        root = soup.find("article") or soup.find("main") or soup.body or soup
+        text = root.get_text("\n", strip=True) if root else ""
+        lines = [ln.strip() for ln in (text or "").splitlines()]
+        lines = [ln for ln in lines if ln]
+        return "\n".join(lines)
+
+    def _on_browser_fallback_done(self, url: str, text: str) -> None:
+        if not hasattr(self, "browser_text"):
+            return
+        self.browser_url_var.set(f"Loaded (fallback): {url}")
+        self.browser_text.delete("1.0", "end")
+        self.browser_text.insert("1.0", text or "")
+        self.browser_text.yview_moveto(0.0)
+
+    def _on_browser_fallback_error(self, url: str, e: Exception) -> None:
+        if not hasattr(self, "browser_text"):
+            return
+        self.browser_url_var.set(f"Failed (fallback): {url}")
+        self.browser_text.delete("1.0", "end")
+        self.browser_text.insert("1.0", f"Could not load article text.\n\nURL: {url}\n\nError:\n{e}")
+        self.browser_text.yview_moveto(0.0)
+
+    def ai_copy_input_clicked(self) -> None:
+        """
+        Copy highlighted text from the Browser panel into the A.I. input box.
+        Falls back to clipboard if nothing is selected in the Browser box.
+        """
+        # Preferred: pull selection directly from the embedded QWebEngineView (real browser).
+        if self._qt_web is not None and _HAVE_QT_WEBENGINE:
+            self.ai_copy_in_btn.configure(state="disabled")
+
+            def _finish(selected: Any) -> None:
+                self.ai_copy_in_btn.configure(state="normal")
+                copied = ("" if selected is None else str(selected)).strip()
+                if not copied:
+                    # Fall back to clipboard (e.g., if user used Ctrl+C in the browser).
+                    try:
+                        copied = str(self.root.clipboard_get() or "").strip()
+                    except Exception:
+                        copied = ""
+
+                if not copied:
+                    messagebox.showinfo("No text", "Highlight text in the Browser panel first.")
+                    return
+
+                self.ai_input_text.delete("1.0", "end")
+                self.ai_input_text.insert("1.0", copied)
+                self._set_status("Copied text into A.I. input.")
+
+            try:
+                # Using JS avoids API differences across PyQt6 versions.
+                self._qt_web.page().runJavaScript(  # type: ignore[union-attr]
+                    "window.getSelection().toString()",
+                    lambda s: self.root.after(0, lambda: _finish(s)),
+                )
+                return
+            except Exception:
+                self.ai_copy_in_btn.configure(state="normal")
+                # Fall through to clipboard/text fallback.
+
+        copied = ""
+        try:
+            if hasattr(self, "browser_text"):
+                copied = self.browser_text.get("sel.first", "sel.last")
+        except Exception:
+            copied = ""
+
+        if not copied.strip():
+            try:
+                copied = str(self.root.clipboard_get() or "")
+            except Exception:
+                copied = ""
+
+        copied = (copied or "").strip()
+        if not copied:
+            messagebox.showinfo("No text", "Highlight text in the Browser panel (or copy it) first.")
+            return
+
+        self.ai_input_text.delete("1.0", "end")
+        self.ai_input_text.insert("1.0", copied)
+        self._set_status("Copied text into A.I. input.")
+
+    def ai_summarize_clicked(self) -> None:
+        copied_text = (self.ai_input_text.get("1.0", "end") or "").rstrip()
+        if not copied_text.strip():
+            messagebox.showinfo("Nothing to summarize", "Copy some text into the A.I. input box first.")
+            return
+
+        self.ai_summarize_btn.configure(state="disabled")
+        self._set_status("Summarizing…")
+
+        def worker() -> None:
+            try:
+                summary = self._summarize_with_openai(copied_text=copied_text)
+            except Exception as e:
+                self.root.after(0, lambda: self._on_summarize_error(e))
+                return
+            self.root.after(0, lambda: self._on_summarize_done(summary))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _summarize_with_openai(self, *, copied_text: str) -> str:
+        # Keep the API key in env var like the filings GUI does.
+        from api_keys import open_ai as oai_key
+
+        if oai_key and not os.environ.get("OPENAI_API_KEY"):
+            os.environ["OPENAI_API_KEY"] = oai_key
+
+        from openai import OpenAI
+
+        client = OpenAI()
+        prompt = f"In less than 300 characters summarize the following article:\n{copied_text}"
+        response = client.responses.create(
+            model="gpt-5.2",
+            input=prompt,
+            reasoning={"effort": "none"},
+            text={"verbosity": "low"},
+        )
+
+        summary = ""
+        try:
+            summary = str(getattr(response, "output_text", "") or "")
+        except Exception:
+            summary = ""
+        if not summary.strip():
+            try:
+                summary = str(response)
+            except Exception:
+                summary = ""
+        return summary
+
+    def _on_summarize_done(self, summary: str) -> None:
+        self.ai_summarize_btn.configure(state="normal")
+        self.ai_output_text.delete("1.0", "end")
+        self.ai_output_text.insert("1.0", (summary or "").strip())
+        self._set_status("Summary ready.")
+
+    def _on_summarize_error(self, e: Exception) -> None:
+        self.ai_summarize_btn.configure(state="normal")
+        self._set_status("Summarize failed.")
+        messagebox.showerror("Summarize failed", str(e))
+
+    def ai_copy_output_clicked(self) -> None:
+        text = (self.ai_output_text.get("1.0", "end") or "").rstrip()
+        if not text.strip():
+            messagebox.showinfo("No text", "No A.I. output to copy yet.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._set_status("Copied A.I. output to clipboard.")
+
+    def ai_post_clicked(self) -> None:
+        tweet_text = (self.ai_output_text.get("1.0", "end") or "").rstrip()
+        if not tweet_text.strip():
+            messagebox.showinfo("No text", "Enter or generate A.I. output first.")
+            return
+        if len(tweet_text) > 280:
+            messagebox.showerror("Tweet too long", f"This text is too long to post.\n\nLength: {len(tweet_text)}/280")
+            return
+
+        link = (self.link_var.get() or "").strip() or None
+        msg = "This will post the A.I. output text to X"
+        if link:
+            msg += " and then reply with the current URL.\n\nContinue?"
+        else:
+            msg += ".\n\nNo URL detected to reply with.\n\nContinue?"
+        if not messagebox.askyesno("Confirm post", msg):
+            return
+
+        self.ai_post_btn.configure(state="disabled")
+        self._set_status("Posting A.I. output to X…")
+
+        def worker() -> None:
+            try:
+                post = self.pc.x_post(text=tweet_text)
+                if link:
+                    self.pc.x_post(text=link, reply_to_tweet_id=post["tweet_id"])
+            except Exception as e:
+                self.root.after(0, lambda: self._on_ai_post_error(e))
+                return
+            self.root.after(0, lambda: self._on_ai_post_done())
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_ai_post_done(self) -> None:
+        self.ai_post_btn.configure(state="normal")
+        self._set_status("Posted successfully.")
+        messagebox.showinfo("Done", "Post sent to X.")
+
+    def _on_ai_post_error(self, e: Exception) -> None:
+        self.ai_post_btn.configure(state="normal")
+        self._set_status("Post failed.")
+        messagebox.showerror("Post failed", str(e))
+
+    def ai_schedule_clicked(self) -> None:
+        tweet_text = (self.ai_output_text.get("1.0", "end") or "").rstrip()
+        if not tweet_text.strip():
+            messagebox.showinfo("No text", "Enter or generate A.I. output first.")
+            return
+        if len(tweet_text) > 280:
+            messagebox.showerror("Tweet too long", f"This text is too long to schedule.\n\nLength: {len(tweet_text)}/280")
+            return
+
+        self._open_schedule_popup(tweet_text=tweet_text, link=(self.link_var.get() or "").strip() or None)
 
     def copy_tweet_text_clicked(self) -> None:
         text = self._current_tweet_text()
@@ -926,11 +1951,7 @@ class NewsHeadlinePosterApp:
 
 def main() -> None:
     root = tk.Tk()
-    # ttk theme (best-effort)
-    try:
-        ttk.Style().theme_use("clam")
-    except Exception:
-        pass
+    _apply_filings_stream_like_style(root)
     NewsHeadlinePosterApp(root)
     root.mainloop()
 
