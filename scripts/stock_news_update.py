@@ -40,5 +40,5 @@ def main():
 
 if __name__ == "__main__":
     symbols_to_update = main()
-    print(f"Symbols updated")
+    print(f"Headlines updated at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
