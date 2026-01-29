@@ -93,6 +93,9 @@ async def stream_filings(
     symbols_set = set(symbols or [])
     sectors_industries = sectors_industries or {}
     banking_industries = banking_industries or set()
+    # If a structured filing callback is provided (GUI usage), avoid also emitting
+    # the CLI-friendly colored log lines for each filing (prevents duplicates + ANSI codes).
+    emit_cli_filing_logs = on_filing is None
 
     def _log(line: str) -> None:
         if on_log is not None:
@@ -158,13 +161,14 @@ async def stream_filings(
                                 except Exception:
                                     pass
 
-                            # Also log in a CLI-friendly way.
-                            if color == "green":
-                                _log(Fore.GREEN + f"{ticker}: {form_type}, {filed_at},\n {Fore.BLUE}{link}")
-                            elif color == "yellow":
-                                _log(Fore.YELLOW + f"{ticker}: {form_type}, {filed_at},\n {Fore.BLUE}{link}")
-                            else:
-                                _log(f"{ticker}: {form_type}, {filed_at},\n {Fore.BLUE}{link}")
+                            # Also log in a CLI-friendly way (CLI usage only).
+                            if emit_cli_filing_logs:
+                                if color == "green":
+                                    _log(Fore.GREEN + f"{ticker}: {form_type}, {filed_at},\n {Fore.BLUE}{link}")
+                                elif color == "yellow":
+                                    _log(Fore.YELLOW + f"{ticker}: {form_type}, {filed_at},\n {Fore.BLUE}{link}")
+                                else:
+                                    _log(f"{ticker}: {form_type}, {filed_at},\n {Fore.BLUE}{link}")
                     else:
                         # Just print whatever came back
                         _log(json.dumps(data, indent=2))
@@ -172,7 +176,13 @@ async def stream_filings(
         except asyncio.CancelledError:
             return
         except Exception as e:
-            _log(f"[ERROR] Connection/stream error: {e}")
+            # The stream sometimes disconnects without a proper websocket close handshake
+            # (common transient condition). Treat it as a warning so the GUI doesn't look "broken".
+            msg = str(e)
+            if "no close frame received or sent" in msg.lower():
+                _log(f"[WARN] Connection dropped (no close frame).")
+            else:
+                _log(f"[ERROR] Connection/stream error: {e}")
             if stop_evt.is_set():
                 break
             _log(f"Reconnecting in {backoff_s}s...")
