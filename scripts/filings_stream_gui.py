@@ -26,7 +26,7 @@ import subprocess
 import sys
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from PyQt6.QtCore import Qt, QThread, QUrl, pyqtSignal
@@ -34,6 +34,7 @@ from PyQt6.QtGui import QDesktopServices, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QCheckBox,
     QDateEdit,
     QDialog,
     QDialogButtonBox,
@@ -172,6 +173,173 @@ class StreamWorker(QThread):
             self._loop = None
             self._stop_evt = None
             self.stopped.emit()
+
+
+class PrefetchSinceMidnightWorker(QThread):
+    log_line = pyqtSignal(str)  # plain text
+    filing_event = pyqtSignal(dict)  # JSON-serializable dict
+    done = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    @staticmethod
+    def _utc_z(dt: datetime) -> str:
+        # Format without '+' to avoid Lucene '+' operator conflicts.
+        dtu = dt.astimezone(timezone.utc)
+        return dtu.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _quote_ticker(t: str) -> str:
+        # Lucene term safety: quote any non-alnum tickers (e.g., BRK.B).
+        s = (t or "").strip().upper()
+        if not s:
+            return ""
+        if all(ch.isalnum() for ch in s):
+            return s
+        # Basic escape for quotes (rare for tickers, but safe)
+        s = s.replace('"', '\\"')
+        return f'"{s}"'
+
+    def run(self) -> None:
+        def _log(line: str) -> None:
+            try:
+                self.log_line.emit(line)
+            except Exception:
+                pass
+
+        try:
+            # Import here so the GUI can still run even if sec-api isn't installed.
+            from sec_api import QueryApi  # type: ignore
+        except Exception as e:
+            self.error.emit(
+                "Missing dependency for Query API.\n\n"
+                "Install with:\n\n  pip install sec-api\n\n"
+                f"Details: {e}"
+            )
+            self.done.emit(0)
+            return
+
+        try:
+            # Pull API key from your existing config used by `scripts/filings_stream.py`.
+            from api_keys import sec_api_key  # type: ignore
+
+            api_key = sec_api_key
+        except Exception as e:
+            self.error.emit(f"Could not load `sec_api_key` from `api_keys.py`: {e}")
+            self.done.emit(0)
+            return
+
+        local_now = datetime.now().astimezone()
+        local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_z = self._utc_z(local_start)
+        end_z = self._utc_z(local_now)
+
+        symbols, sectors_industries, banking_industries = load_symbol_metadata()
+        symbols_set = set([s.strip().upper() for s in (symbols or []) if str(s).strip()])
+
+        # Batch tickers to keep Lucene queries reasonably sized.
+        # If the watchlist is empty, fall back to "all filings since midnight".
+        tickers = sorted(symbols_set)
+        batches: list[list[str]] = []
+        if tickers:
+            batch_size = 50
+            for i in range(0, len(tickers), batch_size):
+                batches.append(tickers[i : i + batch_size])
+        else:
+            batches = [[]]
+            _log("[GUI] Watchlist empty; loading all filings since midnight (may be large).")
+
+        query_api = QueryApi(api_key=api_key)
+
+        filings_out: list[dict[str, Any]] = []
+
+        for batch in batches:
+            try:
+                date_range = f"filedAt:[{start_z} TO {end_z}]"
+                if batch:
+                    quoted = [self._quote_ticker(t) for t in batch]
+                    quoted = [q for q in quoted if q]
+                    ticker_clause = f"ticker:({','.join(quoted)})"
+                    search_query = f"{ticker_clause} AND {date_range}"
+                else:
+                    search_query = date_range
+
+                # Paginate through results; Query API returns up to 50 per call and 10k max per query.
+                from_param = 0
+                while True:
+                    params = {
+                        "query": search_query,
+                        "from": str(from_param),
+                        "size": "50",
+                        "sort": [{"filedAt": {"order": "desc"}}],
+                    }
+                    resp = query_api.get_filings(params)
+                    page = resp.get("filings") if isinstance(resp, dict) else None
+                    if not isinstance(page, list) or not page:
+                        break
+                    for f in page:
+                        if isinstance(f, dict):
+                            filings_out.append(f)
+                    from_param += 50
+                    # Stop if we hit the 10k cap (best-effort safeguard).
+                    if from_param >= 10000:
+                        _log("[GUI] Query API cap reached (10,000 filings) for a batch.")
+                        break
+            except Exception as e:
+                # Keep going on other batches (best-effort).
+                _log(f"[GUI] Prefetch batch failed: {e}")
+                continue
+
+        # Sort chronologically so the feed reads naturally.
+        def _filed_at_dt(v: Any) -> datetime:
+            s = "" if v is None else str(v).strip()
+            try:
+                # Typical: 2024-10-02T09:06:34-04:00
+                return datetime.fromisoformat(s)
+            except Exception:
+                return datetime.min.replace(tzinfo=timezone.utc)
+
+        filings_out.sort(key=lambda f: _filed_at_dt(f.get("filedAt")))
+
+        emitted = 0
+        for filing in filings_out:
+            try:
+                ticker = str(filing.get("ticker", "") or "")
+                if symbols_set and ticker.strip().upper() not in symbols_set:
+                    continue
+
+                form_type = str(filing.get("formType", "") or "")
+                filed_at_raw = str(filing.get("filedAt", "") or "")
+                filed_at = filed_at_raw.replace("T", " ").replace("-05:00", "")
+                link = str(filing.get("linkToFilingDetails", "") or "")
+
+                color = "default"
+                try:
+                    t = ticker.strip().upper()
+                    if (t in sectors_industries) and (
+                        sectors_industries[t].get("industry") not in banking_industries
+                    ):
+                        color = "green"
+                    elif t not in sectors_industries:
+                        color = "yellow"
+                except Exception:
+                    color = "default"
+
+                payload = {
+                    "ticker": ticker,
+                    "form_type": form_type,
+                    "filed_at": filed_at,
+                    "link": link,
+                    "color": color,
+                }
+                self.filing_event.emit(payload)
+                emitted += 1
+            except Exception:
+                continue
+
+        self.done.emit(emitted)
 
 
 class SummarizeWorker(QThread):
@@ -323,12 +491,17 @@ class FilingsStreamWindow(QMainWindow):
         self.ticker_filter_input = QLineEdit()
         self.ticker_filter_input.setPlaceholderText("ticker: AAPL MSFT, form: 4 8-K")
         self.status_label = QLabel("Ready")
+        self.load_since_midnight_chk = QCheckBox("Load Today's Filings")
+        self.load_since_midnight_chk.setToolTip(
+            "Before starting the live stream, fetch filings filed since local midnight using the SEC Filing Query API."
+        )
 
         controls.addWidget(self.start_btn)
         controls.addWidget(self.stop_btn)
         controls.addWidget(self.clear_btn)
         controls.addWidget(QLabel("Filter"))
         controls.addWidget(self.ticker_filter_input, 1)
+        controls.addWidget(self.load_since_midnight_chk)
         controls.addWidget(self.status_label)
 
         self.start_btn.clicked.connect(self.start_stream)
@@ -439,6 +612,7 @@ class FilingsStreamWindow(QMainWindow):
     def _set_running(self, running: bool) -> None:
         self.start_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
+        self.load_since_midnight_chk.setEnabled(not running)
         self.status_label.setText("Running" if running else "Ready")
 
     def append_log(self, line: str) -> None:
@@ -627,14 +801,49 @@ class FilingsStreamWindow(QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             return
 
-        self._worker = StreamWorker()
-        self._worker.log_line.connect(self.append_log)
-        self._worker.filing_event.connect(self.append_filing)
-        self._worker.status.connect(self.status_label.setText)
-        self._worker.stopped.connect(lambda: self._set_running(False))
+        def _start_live_stream() -> None:
+            self._worker = StreamWorker()
+            self._worker.log_line.connect(self.append_log)
+            self._worker.filing_event.connect(self.append_filing)
+            self._worker.status.connect(self.status_label.setText)
+            self._worker.stopped.connect(lambda: self._set_running(False))
 
-        self._set_running(True)
-        self._worker.start()
+            self._set_running(True)
+            self._worker.start()
+
+        if self.load_since_midnight_chk.isChecked():
+            # Prefetch in a background thread so the UI stays responsive.
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self.load_since_midnight_chk.setEnabled(False)
+            self.status_label.setText("Loading Today's Filings…")
+            self.append_log("[GUI] Loading Today's Filings…")
+
+            pre = PrefetchSinceMidnightWorker()
+            pre.log_line.connect(self.append_log)
+            pre.filing_event.connect(self.append_filing)
+
+            def _prefetch_done(count: int) -> None:
+                self.append_log(f"[GUI] Loaded {count} filing(s).")
+                # Start live stream regardless; prefetch is best-effort.
+                _start_live_stream()
+
+            def _prefetch_error(msg: str) -> None:
+                self.append_log(f"[GUI] Prefetch error: {msg}")
+                try:
+                    QMessageBox.warning(self, "Prefetch error", msg)
+                except Exception:
+                    pass
+
+            pre.done.connect(_prefetch_done)
+            pre.error.connect(_prefetch_error)
+
+            # Keep reference so it isn't GC'd mid-run.
+            self._prefetch_worker = pre  # type: ignore[attr-defined]
+            pre.start()
+            return
+
+        _start_live_stream()
 
     def stop_stream(self) -> None:
         if self._worker is None:
