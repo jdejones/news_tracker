@@ -10,9 +10,21 @@ script_dir = os.path.dirname(script_file)
 project_root = os.path.dirname(script_dir)
 
 sys.path.insert(0, project_root)
+sys.path.insert(0, r"C:\Users\jdejo\Logger")
+
+
+
+import logging
+logging.basicConfig(level=logging.INFO, force=True)
+# overview_logger = logging.getLogger("org_logging.overview")
+from org_logging.timing import log_duration, log_timing
+from org_logging import configure_logging, get_logger
+run_id = configure_logging(app_name="news-tracker", log_dir=r"C:\Users\jdejo\logs")
+overview_logger = get_logger("org_logging.overview", run_id=run_id)  # important: adds app/run_id fields
 
 from Finviz_News_Processing import Controller
 
+@log_duration(name="stock_news_update", logger=overview_logger)
 def main():
     controller = Controller()
     controller._load_queue()
