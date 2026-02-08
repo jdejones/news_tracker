@@ -76,9 +76,8 @@ class UserInterface(NewsImporter):
             return df3
         return self.headlines
     
-    def get_tables(self) -> list[str]:
+    def get_tables(self, url: str = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news_topics") -> list[str]:
         """Get list of all table names in the 'news' database."""
-        url = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
         engine = create_engine(url, pool_pre_ping=True, connect_args={'connect_timeout': 5})
         
         inspector = inspect(engine)
@@ -89,7 +88,8 @@ class UserInterface(NewsImporter):
     def store_headlines(self, 
                         topic: str, 
                         headlines: list[int|str, str] | pd.DataFrame, 
-                        dataframe: bool = False):
+                        dataframe: bool = False,
+                        url: str = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news_topics"):
         """
         Store `headlines` into a MySQL database named `headlines`.
 
@@ -117,7 +117,6 @@ class UserInterface(NewsImporter):
         
         #Remove headlines if previously stored
         if topic in self.get_tables():
-            url = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
             engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
 
             # query database -> DataFrame
@@ -148,9 +147,6 @@ class UserInterface(NewsImporter):
 
         if not rows:
             return pd.DataFrame(columns=["saved_date", "headline"]) if dataframe else 0
-
-        # SQLAlchemy connection URL (mysql-connector-python driver).
-        url = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
 
         # Create database if needed (connect at server level).
         engine = create_engine(url, pool_pre_ping=True, connect_args={'connect_timeout': 5})
@@ -187,8 +183,8 @@ class UserInterface(NewsImporter):
             return pd.DataFrame({"saved_date": [r[0] for r in rows], "headline": [r[1] for r in rows], "link": [r[2] for r in rows]})
         return inserted
 
-    def retrieve_headlines(self, topic: str):
-        url = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
+    def retrieve_headlines(self, topic: str,
+                           url: str = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"):
         engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
         table = pd.read_sql(f"SELECT * FROM {topic}", con=engine)
         return table
