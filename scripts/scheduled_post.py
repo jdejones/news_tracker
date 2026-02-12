@@ -21,7 +21,7 @@ script_file = os.path.realpath(os.path.abspath(__file__))
 
 # Get script directory and project root (two levels up)
 script_dir = os.path.dirname(script_file)
-project_root = os.path.dirname(os.path.dirname(script_dir))
+project_root = os.path.dirname(script_dir)#os.path.dirname(os.path.dirname(script_dir))
 
 # Validate that project_root exists and contains expected files
 if not os.path.exists(project_root) or not os.path.exists(os.path.join(project_root, 'x.py')):
