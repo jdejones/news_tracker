@@ -21,6 +21,7 @@ Dependencies (install via pip):
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -29,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from PyQt6.QtCore import Qt, QThread, QUrl, pyqtSignal
+from PyQt6.QtCore import QSettings, Qt, QThread, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -61,6 +62,8 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+
+GUI_FEED_LOG_PATH = os.path.join(_PROJECT_ROOT, "filings_stream_gui_log.jsonl")
 
 from scripts.filings_stream import load_symbol_metadata, stream_filings
 from api_keys import open_ai as oai_key
@@ -471,8 +474,11 @@ class FilingsStreamWindow(QMainWindow):
         self._form_filter: set[str] | None = None
         self._feed_history: list[tuple[str, Any]] = []  # ("log", str) | ("filing", dict)
         self._max_feed_history = 2000
+        self._store_feed_data = False
+        self._settings = QSettings("NewsTracker", "FilingsStreamGui")
 
         self._build_ui()
+        self._load_checkbox_settings()
         self._set_running(False)
 
     def _build_ui(self) -> None:
@@ -495,6 +501,14 @@ class FilingsStreamWindow(QMainWindow):
         self.load_since_midnight_chk.setToolTip(
             "Before starting the live stream, fetch filings filed since local midnight using the SEC Filing Query API."
         )
+        self.store_data_chk = QCheckBox("Store Data")
+        self.store_data_chk.setToolTip(
+            f"Store GUI log and filing rows appended after Start to {GUI_FEED_LOG_PATH}."
+        )
+        self.clear_log_chk = QCheckBox("Clear Log")
+        self.clear_log_chk.setToolTip(
+            "Clear the stored GUI data file when Start is pressed."
+        )
 
         controls.addWidget(self.start_btn)
         controls.addWidget(self.stop_btn)
@@ -502,6 +516,8 @@ class FilingsStreamWindow(QMainWindow):
         controls.addWidget(QLabel("Filter"))
         controls.addWidget(self.ticker_filter_input, 1)
         controls.addWidget(self.load_since_midnight_chk)
+        controls.addWidget(self.store_data_chk)
+        controls.addWidget(self.clear_log_chk)
         controls.addWidget(self.status_label)
 
         self.start_btn.clicked.connect(self.start_stream)
@@ -613,7 +629,26 @@ class FilingsStreamWindow(QMainWindow):
         self.start_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
         self.load_since_midnight_chk.setEnabled(not running)
+        self.store_data_chk.setEnabled(not running)
+        self.clear_log_chk.setEnabled(not running)
         self.status_label.setText("Running" if running else "Ready")
+
+    def _load_checkbox_settings(self) -> None:
+        self.load_since_midnight_chk.setChecked(
+            self._settings.value("checkboxes/load_today", False, type=bool)
+        )
+        self.store_data_chk.setChecked(
+            self._settings.value("checkboxes/store_data", False, type=bool)
+        )
+        self.clear_log_chk.setChecked(
+            self._settings.value("checkboxes/clear_log", False, type=bool)
+        )
+
+    def _save_checkbox_settings(self) -> None:
+        self._settings.setValue("checkboxes/load_today", self.load_since_midnight_chk.isChecked())
+        self._settings.setValue("checkboxes/store_data", self.store_data_chk.isChecked())
+        self._settings.setValue("checkboxes/clear_log", self.clear_log_chk.isChecked())
+        self._settings.sync()
 
     def append_log(self, line: str) -> None:
         self._push_history(("log", line))
@@ -624,6 +659,7 @@ class FilingsStreamWindow(QMainWindow):
         ts = _now_str()
         safe = _html_escape(line)
         self.feed.append(f"<span style='color:#666'>[{ts}]</span> {safe}")
+        self._store_feed_item("log", {"line": line, "display_time": ts})
         # Only auto-scroll if the user was already at the bottom.
         if was_at_bottom:
             self.feed.moveCursor(QTextCursor.MoveOperation.End)
@@ -675,6 +711,17 @@ class FilingsStreamWindow(QMainWindow):
         old_value = sb.value()
 
         self.feed.append(block)
+        self._store_feed_item(
+            "filing",
+            {
+                "ticker": ev.ticker,
+                "form_type": ev.form_type,
+                "filed_at": ev.filed_at,
+                "link": ev.link,
+                "color": ev.color,
+                "display_time": ts,
+            },
+        )
         # Only auto-scroll if the user was already at the bottom.
         if was_at_bottom:
             self.feed.moveCursor(QTextCursor.MoveOperation.End)
@@ -690,6 +737,35 @@ class FilingsStreamWindow(QMainWindow):
         if len(self._feed_history) > self._max_feed_history:
             # Drop oldest in a simple FIFO manner.
             self._feed_history = self._feed_history[-self._max_feed_history :]
+
+    def _clear_data_log_file(self) -> bool:
+        try:
+            with open(GUI_FEED_LOG_PATH, "w", encoding="utf-8"):
+                pass
+            return True
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Could not clear log",
+                f"Could not clear stored GUI data file:\n\n{GUI_FEED_LOG_PATH}\n\n{e}",
+            )
+            return False
+
+    def _store_feed_item(self, kind: str, data: dict[str, Any]) -> None:
+        if not self._store_feed_data:
+            return
+
+        record = {
+            "stored_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "kind": kind,
+            "data": data,
+        }
+        try:
+            with open(GUI_FEED_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            # Avoid recursive GUI logging if persistence fails mid-stream.
+            pass
 
     def _parse_filters(self, raw: str) -> tuple[set[str] | None, set[str] | None]:
         """
@@ -799,6 +875,10 @@ class FilingsStreamWindow(QMainWindow):
 
     def start_stream(self) -> None:
         if self._worker is not None and self._worker.isRunning():
+            return
+
+        self._store_feed_data = self.store_data_chk.isChecked()
+        if self.clear_log_chk.isChecked() and not self._clear_data_log_file():
             return
 
         def _start_live_stream() -> None:
@@ -1242,6 +1322,7 @@ class FilingsStreamWindow(QMainWindow):
         QApplication.clipboard().setText(txt)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._save_checkbox_settings()
         # Best-effort stop the stream thread cleanly on window close.
         try:
             self.stop_stream()
