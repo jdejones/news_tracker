@@ -7,6 +7,7 @@ from utils import finviz_api_urls
 import requests
 import pandas as pd
 from io import StringIO
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Iterator, Optional
 import queue
@@ -22,10 +23,45 @@ from sqlalchemy import (
     String,
     DateTime,
     Text,
+    text,
 )
 import time
 import warnings
 import tqdm
+
+
+MYSQL_TABLE_MUTATION_LOCK_NAME = "market_data_table_mutation_lock"
+MYSQL_TABLE_MUTATION_LOCK_TIMEOUT_SECONDS = 3600
+
+
+@contextmanager
+def mysql_table_mutation_lock(engine):
+    lock_conn = engine.connect()
+    acquired = False
+    try:
+        result = lock_conn.execute(
+            text("SELECT GET_LOCK(:lock_name, :timeout_seconds)"),
+            {
+                "lock_name": MYSQL_TABLE_MUTATION_LOCK_NAME,
+                "timeout_seconds": MYSQL_TABLE_MUTATION_LOCK_TIMEOUT_SECONDS,
+            },
+        ).scalar()
+        if result != 1:
+            raise TimeoutError(
+                f"Timed out waiting for MySQL advisory lock: {MYSQL_TABLE_MUTATION_LOCK_NAME}"
+            )
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            try:
+                lock_conn.execute(
+                    text("SELECT RELEASE_LOCK(:lock_name)"),
+                    {"lock_name": MYSQL_TABLE_MUTATION_LOCK_NAME},
+                )
+            except Exception as error:
+                warnings.warn(f"Unable to release MySQL advisory lock: {error}")
+        lock_conn.close()
 
 
 class FinvizNewsImporter:
@@ -101,24 +137,25 @@ class Controller:
         Columns:
             Title, Source, Date, Url, Category, Ticker
         """
-        insp = inspect(self.engine)
-        table_name = symbol.lower()
-        if table_name in insp.get_table_names():
-            return
+        with mysql_table_mutation_lock(self.engine):
+            insp = inspect(self.engine)
+            table_name = symbol.lower()
+            if table_name in insp.get_table_names():
+                return
 
-        md = MetaData()
-        Table(
-            table_name,
-            md,
-            Column("Title", Text, nullable=True),
-            Column("Source", String(255), nullable=True),
-            Column("Date", DateTime, nullable=True),
-            Column("Url", Text, nullable=True),
-            Column("Category", String(255), nullable=True),
-            Column("Ticker", String(32), nullable=True, index=True),
-            mysql_charset="utf8mb4",
-        )
-        md.create_all(self.engine)
+            md = MetaData()
+            Table(
+                table_name,
+                md,
+                Column("Title", Text, nullable=True),
+                Column("Source", String(255), nullable=True),
+                Column("Date", DateTime, nullable=True),
+                Column("Url", Text, nullable=True),
+                Column("Category", String(255), nullable=True),
+                Column("Ticker", String(32), nullable=True, index=True),
+                mysql_charset="utf8mb4",
+            )
+            md.create_all(self.engine)
 
     def _most_recent_link_symbol_cached(self, symbol: str) -> str:
         sym = str(symbol).upper()
@@ -186,9 +223,10 @@ class Controller:
         if not getattr(self, "_cache_dirty", False):
             return
         try:
-            self.cache_most_recent_link.to_sql(
-                "cache_most_recent_link", con=self.engine, if_exists="replace", index=False
-            )
+            with mysql_table_mutation_lock(self.engine):
+                self.cache_most_recent_link.to_sql(
+                    "cache_most_recent_link", con=self.engine, if_exists="replace", index=False
+                )
             self._cache_dirty = False
         except Exception:
             # Best-effort: leave dirty so a later flush might succeed.
@@ -196,7 +234,10 @@ class Controller:
     
     def _update_most_recent_link_cached_all(self):
         self._most_recent_link_all()
-        self.most_recent_link_all_df.to_sql("cache_most_recent_link", con=self.engine, if_exists='replace', index=False)
+        with mysql_table_mutation_lock(self.engine):
+            self.most_recent_link_all_df.to_sql(
+                "cache_most_recent_link", con=self.engine, if_exists='replace', index=False
+            )
         # Keep in-memory cache in sync.
         self.cache_most_recent_link = self.most_recent_link_all_df.copy()
         self._cache_dirty = False
@@ -362,7 +403,8 @@ class Controller:
                 ]
             )
             if len(results_todb) > 0:
-                results_todb.to_sql(symbol_l, con=self.engine, if_exists="append", index=False)
+                with mysql_table_mutation_lock(self.engine):
+                    results_todb.to_sql(symbol_l, con=self.engine, if_exists="append", index=False)
                 if len(self.most_recent_updates) >= 100:
                     self.most_recent_updates.remove(self.most_recent_updates[0])
                     self.most_recent_updates.append(symbol)
@@ -492,7 +534,8 @@ class Controller:
                         ]
                     )
                     if len(results_todb) > 0:
-                        results_todb.to_sql(symbol_l, con=self.engine, if_exists="append", index=False)
+                        with mysql_table_mutation_lock(self.engine):
+                            results_todb.to_sql(symbol_l, con=self.engine, if_exists="append", index=False)
                         if len(self.most_recent_updates) >= 100:
                             self.most_recent_updates.remove(self.most_recent_updates[0])
                             self.most_recent_updates.append(symbol_u)
