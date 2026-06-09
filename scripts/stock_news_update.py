@@ -24,7 +24,7 @@ overview_logger = get_logger("org_logging.overview", run_id=run_id)  # important
 
 from Finviz_News_Processing import Controller
 
-@log_duration(name="stock_news_update", logger=overview_logger)
+@log_duration(name="stock_news_update", logger=overview_logger, unit="m")
 def main():
     controller = Controller()
     controller._load_queue()
