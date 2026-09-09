@@ -233,11 +233,15 @@ class NewsHeadlinePosterWindow(QMainWindow):
         self.headline_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.headline_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         header = self.headline_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setMinimumSectionSize(50)
+        self.headline_table.setColumnWidth(0, 135)
+        self.headline_table.setColumnWidth(1, 400)
+        self.headline_table.setColumnWidth(2, 120)
+        self.headline_table.setColumnWidth(3, 120)
+        self.headline_table.setColumnWidth(4, 350)
+        self.headline_table.setSortingEnabled(True)
+        self.headline_table.sortItems(0, Qt.SortOrder.DescendingOrder)
         self.headline_table.itemSelectionChanged.connect(self._on_row_selected)
         self.headline_table.cellDoubleClicked.connect(lambda _row, _col: self.open_link_clicked())
         left_split.addWidget(self.headline_table)
@@ -482,6 +486,8 @@ class NewsHeadlinePosterWindow(QMainWindow):
                 rows.append(row)
 
         self._rows = rows
+        sorting_enabled = self.headline_table.isSortingEnabled()
+        self.headline_table.setSortingEnabled(False)
         self.headline_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             values = [
@@ -492,7 +498,11 @@ class NewsHeadlinePosterWindow(QMainWindow):
                 row.url,
             ]
             for column_index, text in enumerate(values):
-                self.headline_table.setItem(row_index, column_index, QTableWidgetItem(text))
+                item = QTableWidgetItem(text)
+                if column_index == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, row)
+                self.headline_table.setItem(row_index, column_index, item)
+        self.headline_table.setSortingEnabled(sorting_enabled)
         self._set_status(f"Loaded {len(rows)} headlines for {(self._selected_symbol or '').upper()}.")
 
     def _on_headlines_loaded_error(self, error: str) -> None:
@@ -504,10 +514,13 @@ class NewsHeadlinePosterWindow(QMainWindow):
         selected = self.headline_table.selectionModel().selectedRows()
         if not selected:
             return
-        index = selected[0].row()
-        if not 0 <= index < len(self._rows):
+        date_item = self.headline_table.item(selected[0].row(), 0)
+        if date_item is None:
             return
-        self._selected_row = self._rows[index]
+        row = date_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(row, HeadlineRow):
+            return
+        self._selected_row = row
         self.title_text.setPlainText(self._tweet_text_for_selection())
         self.link_entry.setText(self._selected_row.url)
         self._maybe_open_link_in_browser()
