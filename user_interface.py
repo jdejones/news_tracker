@@ -185,9 +185,24 @@ class UserInterface(NewsImporter):
 
     def retrieve_headlines(self, topic: str,
                            url: str = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"):
+        """Retrieve one ticker's rows from the consolidated stock-news table."""
+        symbol = str(topic).strip().upper()
+        if not symbol:
+            raise ValueError("topic must contain a stock symbol")
         engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
-        table = pd.read_sql(f"SELECT * FROM {topic}", con=engine)
-        return table
+        try:
+            return pd.read_sql(
+                sql_text(
+                    "SELECT Title, Source, Date, Url, Category, Ticker "
+                    "FROM stock_news "
+                    "WHERE Ticker = :ticker "
+                    "ORDER BY Date DESC"
+                ),
+                con=engine,
+                params={"ticker": symbol},
+            )
+        finally:
+            engine.dispose()
 
     def get_tags(folder=r"E:\Market Research\Dataset\News\Market News\tags"):
         return os.listdir(folder)

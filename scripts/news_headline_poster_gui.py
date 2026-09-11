@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable
 
 import pandas as pd
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, text
 
 from PyQt6.QtCore import QDate, QThread, QTime, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QMouseEvent
@@ -85,27 +85,52 @@ def _safe_dt(value: Any) -> datetime | None:
 
 
 def list_news_symbols() -> list[str]:
-    """Return ticker-like table names from the news database."""
+    """Return symbols represented in the consolidated news table."""
     engine = create_engine(NEWS_DB_URL, pool_pre_ping=True, connect_args={"connect_timeout": 5})
-    tables = inspect(engine).get_table_names()
-    excluded = {"cache_most_recent_link"}
-    return sorted(
-        {
-            str(table).lower().strip()
-            for table in tables
-            if str(table).lower().strip() not in excluded
-            and not str(table).lower().strip().startswith(("cache_", "tmp_"))
-        }
-    )
+    try:
+        symbols = pd.read_sql(
+            text("SELECT DISTINCT Ticker FROM stock_news ORDER BY Ticker"),
+            con=engine,
+        )
+        return symbols["Ticker"].dropna().astype(str).str.lower().tolist()
+    finally:
+        engine.dispose()
 
 
-def retrieve_symbol_headlines(symbol: str) -> pd.DataFrame:
-    """Read one per-symbol table from the news database."""
-    sym = str(symbol).strip().lower()
+def retrieve_symbol_headlines(
+    symbol: str,
+    *,
+    since: datetime | None = None,
+    limit: int = 500,
+) -> pd.DataFrame:
+    """Read one symbol's headlines from the consolidated news table."""
+    sym = str(symbol).strip().upper()
     if not sym:
         raise ValueError("symbol must be non-empty")
+    if limit <= 0:
+        raise ValueError("limit must be greater than zero")
+
     engine = create_engine(NEWS_DB_URL, pool_pre_ping=True, connect_args={"connect_timeout": 5})
-    return pd.read_sql(f"SELECT * FROM `{sym}`", con=engine)
+    columns = "Title, Source, Date, Url, Category, Ticker"
+    if since is None:
+        statement = text(
+            f"SELECT {columns} FROM stock_news "
+            "WHERE Ticker = :ticker "
+            "ORDER BY Date DESC LIMIT :limit"
+        )
+        params = {"ticker": sym, "limit": limit}
+    else:
+        statement = text(
+            f"SELECT {columns} FROM stock_news "
+            "WHERE Ticker = :ticker AND Date >= :since "
+            "ORDER BY Date DESC LIMIT :limit"
+        )
+        params = {"ticker": sym, "since": since, "limit": limit}
+
+    try:
+        return pd.read_sql(statement, con=engine, params=params)
+    finally:
+        engine.dispose()
 
 
 class FunctionWorker(QThread):
@@ -446,13 +471,10 @@ class NewsHeadlinePosterWindow(QMainWindow):
         self._set_status(f"Loading headlines for {symbol.upper()}…")
 
         def load() -> pd.DataFrame:
-            df = retrieve_symbol_headlines(symbol)
+            df = retrieve_symbol_headlines(symbol, since=since_dt, limit=500)
             if "Date" in df.columns:
                 df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-                if since_dt is not None:
-                    df = df.loc[df["Date"] >= since_dt]
-                df = df.sort_values("Date", ascending=False)
-            return df.head(500)
+            return df
 
         self._start_worker(load, self._on_headlines_loaded, self._on_headlines_loaded_error)
 

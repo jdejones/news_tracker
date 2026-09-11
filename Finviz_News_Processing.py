@@ -16,18 +16,16 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from sqlalchemy import (
     create_engine,
-    inspect,
     MetaData,
     Table,
-    Column,
-    String,
-    DateTime,
-    Text,
     text,
 )
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 import time
 import warnings
 import tqdm
+
+from database_migration.table_consolidation_script import calculate_article_hash
 
 
 MYSQL_TABLE_MUTATION_LOCK_NAME = "market_data_table_mutation_lock"
@@ -109,6 +107,11 @@ class Controller:
         self.database_url = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
         self.engine = create_engine(self.database_url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
         self.cache_most_recent_link = pd.read_sql("SELECT * FROM cache_most_recent_link", con=self.engine)
+        self.stock_news_table = Table(
+            "stock_news",
+            MetaData(),
+            autoload_with=self.engine,
+        )
 
 
         # If True, symbols that aren't present in the finviz screener export (most_recent_link_all_df)
@@ -130,32 +133,61 @@ class Controller:
                 # Best-effort: script can still run without cache, but won't be able to "drain" naturally.
                 pass
 
-    def _ensure_symbol_news_table(self, symbol: str) -> None:
-        """
-        Ensure a per-ticker MySQL table exists with canonical column names.
+    @staticmethod
+    def _database_value(value):
+        """Convert pandas missing/scalar values into MySQL-compatible values."""
+        if value is None or pd.isna(value):
+            return None
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime()
+        return value
 
-        Columns:
-            Title, Source, Date, Url, Category, Ticker
-        """
-        with mysql_table_mutation_lock(self.engine):
-            insp = inspect(self.engine)
-            table_name = symbol.lower()
-            if table_name in insp.get_table_names():
-                return
+    def _store_news_rows(self, rows: pd.DataFrame) -> int:
+        """Insert rows into the consolidated table and ignore existing hashes."""
+        if rows is None or len(rows) == 0:
+            return 0
 
-            md = MetaData()
-            Table(
-                table_name,
-                md,
-                Column("Title", Text, nullable=True),
-                Column("Source", String(255), nullable=True),
-                Column("Date", DateTime, nullable=True),
-                Column("Url", Text, nullable=True),
-                Column("Category", String(255), nullable=True),
-                Column("Ticker", String(32), nullable=True, index=True),
-                mysql_charset="utf8mb4",
+        payload = []
+        for record in rows.to_dict(orient="records"):
+            published_at = self._database_value(record.get("Date"))
+            title = self._database_value(record.get("Title"))
+            source = self._database_value(record.get("Source"))
+            url = self._database_value(record.get("Url"))
+            category = self._database_value(record.get("Category"))
+            ticker_value = self._database_value(record.get("Ticker"))
+            ticker = "" if ticker_value is None else str(ticker_value).strip().upper()
+            if not ticker:
+                continue
+
+            payload.append(
+                {
+                    "Ticker": ticker,
+                    "Title": "" if title is None else title,
+                    "Source": source,
+                    "Date": published_at,
+                    "Url": url,
+                    "Category": category,
+                    "article_hash": calculate_article_hash(
+                        published_at=published_at,
+                        url=url,
+                        source=source,
+                        title=title,
+                    ),
+                }
             )
-            md.create_all(self.engine)
+
+        if not payload:
+            return 0
+
+        statement = (
+            mysql_insert(self.stock_news_table)
+            .values(payload)
+            .prefix_with("IGNORE")
+        )
+        with mysql_table_mutation_lock(self.engine):
+            with self.engine.begin() as connection:
+                result = connection.execute(statement)
+        return max(0, int(result.rowcount or 0))
 
     def _most_recent_link_symbol_cached(self, symbol: str) -> str:
         sym = str(symbol).upper()
@@ -288,10 +320,12 @@ class Controller:
             node.skip = True if self._compare_most_recent_link(sym) else False
                     
     def _get_tables(self) -> list[str]:
-        return inspect(self.engine).get_table_names()
-
-    def _get_table_exists(self, symbol: str) -> bool:
-        return symbol.lower() in self._get_tables()
+        """Return stored symbols for compatibility with existing callers."""
+        symbols = pd.read_sql(
+            text("SELECT DISTINCT Ticker FROM stock_news ORDER BY Ticker"),
+            con=self.engine,
+        )
+        return symbols["Ticker"].astype(str).str.lower().tolist()
 
     def _batch_symbols_by_headline_budget(
         self,
@@ -377,14 +411,6 @@ class Controller:
                 continue
             
             symbol_u = symbol.upper()
-            symbol_l = symbol.lower()
-
-            if self._get_table_exists(symbol_l):
-                stored_df = pd.read_sql(f"SELECT * FROM `{symbol_l}` limit 300", con=self.engine)
-            else:
-                self._ensure_symbol_news_table(symbol_l)
-                stored_df = pd.read_sql(f"SELECT * FROM `{symbol_l}` limit 300", con=self.engine)
-
             symbol_results = results.loc[results["Ticker"] == symbol_u]
 
             daily_results = len(symbol_results.loc[symbol_results["Date"] > datetime.now() - timedelta(days=1)])
@@ -396,15 +422,8 @@ class Controller:
                             node.headline_count = 1
                         break
 
-            results_todb = (
-                symbol_results.loc[
-                    ((~symbol_results["Url"].isin(stored_df["Url"].values)) &
-                     (~symbol_results["Title"].isin(stored_df["Title"].values)))
-                ]
-            )
-            if len(results_todb) > 0:
-                with mysql_table_mutation_lock(self.engine):
-                    results_todb.to_sql(symbol_l, con=self.engine, if_exists="append", index=False)
+            inserted_rows = self._store_news_rows(symbol_results)
+            if inserted_rows > 0:
                 if len(self.most_recent_updates) >= 100:
                     self.most_recent_updates.remove(self.most_recent_updates[0])
                     self.most_recent_updates.append(symbol)
@@ -463,7 +482,6 @@ class Controller:
 
                 for symbol_u in batch:
                     symbol = str(symbol_u)
-                    symbol_l = symbol.lower()
 
                     # Skip if the node became skippable (best-effort).
                     with self.q.mutex:
@@ -500,16 +518,6 @@ class Controller:
                                     break
                             continue
 
-                    if self._get_table_exists(symbol_l):
-                        stored_df = pd.read_sql(
-                            f"SELECT * FROM `{symbol_l}` limit 300", con=self.engine
-                        )
-                    else:
-                        self._ensure_symbol_news_table(symbol_l)
-                        stored_df = pd.read_sql(
-                            f"SELECT * FROM `{symbol_l}` limit 300", con=self.engine
-                        )
-
                     symbol_results = single_results.loc[
                         single_results["Ticker"].astype(str).str.upper() == symbol_u
                     ]
@@ -527,15 +535,8 @@ class Controller:
                                     node.headline_count = 1
                                 break
 
-                    results_todb = (
-                        symbol_results.loc[
-                            ((~symbol_results["Url"].isin(stored_df["Url"].values)) |
-                             (~symbol_results["Title"].isin(stored_df["Title"].values)))
-                        ]
-                    )
-                    if len(results_todb) > 0:
-                        with mysql_table_mutation_lock(self.engine):
-                            results_todb.to_sql(symbol_l, con=self.engine, if_exists="append", index=False)
+                    inserted_rows = self._store_news_rows(symbol_results)
+                    if inserted_rows > 0:
                         if len(self.most_recent_updates) >= 100:
                             self.most_recent_updates.remove(self.most_recent_updates[0])
                             self.most_recent_updates.append(symbol_u)
