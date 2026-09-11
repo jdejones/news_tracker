@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -69,6 +70,17 @@ NEWS_DB_URL = f"mysql+pymysql://root:{news_database}@127.0.0.1:3306/news"
 
 @dataclass(frozen=True)
 class HeadlineRow:
+    title: str
+    url: str
+    date: datetime | None
+    source: str | None = None
+    category: str | None = None
+
+
+@dataclass(frozen=True)
+class FeedRow:
+    news_id: int
+    ticker: str
     title: str
     url: str
     date: datetime | None
@@ -127,6 +139,44 @@ def retrieve_symbol_headlines(
         )
         params = {"ticker": sym, "since": since, "limit": limit}
 
+    try:
+        return pd.read_sql(statement, con=engine, params=params)
+    finally:
+        engine.dispose()
+
+
+def retrieve_news_feed(
+    symbols: list[str],
+    *,
+    after_id: int | None = None,
+    limit: int = 500,
+) -> pd.DataFrame:
+    """Read the latest rows, or rows added after an id, for several symbols."""
+    normalized = list(dict.fromkeys(str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()))
+    if not normalized:
+        raise ValueError("at least one symbol is required")
+    if limit <= 0:
+        raise ValueError("limit must be greater than zero")
+
+    symbol_params = {f"symbol_{index}": symbol for index, symbol in enumerate(normalized)}
+    placeholders = ", ".join(f":{name}" for name in symbol_params)
+    columns = "id, Ticker, Title, Source, Date, Url, Category"
+    params: dict[str, Any] = {**symbol_params, "limit": limit}
+    if after_id is None:
+        statement = text(
+            f"SELECT {columns} FROM stock_news "
+            f"WHERE Ticker IN ({placeholders}) "
+            "ORDER BY id DESC LIMIT :limit"
+        )
+    else:
+        statement = text(
+            f"SELECT {columns} FROM stock_news "
+            f"WHERE Ticker IN ({placeholders}) AND id > :after_id "
+            "ORDER BY id ASC LIMIT :limit"
+        )
+        params["after_id"] = after_id
+
+    engine = create_engine(NEWS_DB_URL, pool_pre_ping=True, connect_args={"connect_timeout": 5})
     try:
         return pd.read_sql(statement, con=engine, params=params)
     finally:
@@ -203,6 +253,11 @@ class NewsHeadlinePosterWindow(QMainWindow):
         self._closing = False
         self._updates_file_path = os.path.join(_PROJECT_ROOT, "most_recent_updates.txt")
         self._updates_file_last_mtime: float | None = None
+        self._feed_symbols: list[str] = []
+        self._feed_seen_ids: set[int] = set()
+        self._feed_last_id = 0
+        self._feed_request_generation = 0
+        self._feed_refresh_in_progress = False
 
         self._build_ui()
         self._apply_style()
@@ -212,6 +267,10 @@ class NewsHeadlinePosterWindow(QMainWindow):
         self._updates_timer.timeout.connect(self._refresh_updates_box)
         self._updates_timer.start(3000)
         self._refresh_updates_box()
+
+        self._feed_timer = QTimer(self)
+        self._feed_timer.timeout.connect(self._poll_news_feed)
+        self._feed_timer.start(3000)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -339,51 +398,53 @@ class NewsHeadlinePosterWindow(QMainWindow):
         self.copy_btn.clicked.connect(self.copy_tweet_text_clicked)
         right_split.addWidget(post_panel)
 
-        ai_split = QSplitter(Qt.Orientation.Vertical)
-        right_split.addWidget(ai_split)
-        ai_input_group = QGroupBox("A.I. input")
-        ai_input_layout = QVBoxLayout(ai_input_group)
-        self.ai_input_text = QPlainTextEdit()
-        ai_input_layout.addWidget(self.ai_input_text, 1)
-        ai_input_buttons = QHBoxLayout()
-        self.ai_copy_in_btn = QPushButton("Copy text")
-        self.ai_summarize_btn = QPushButton("Summarize")
-        ai_input_buttons.addWidget(self.ai_copy_in_btn)
-        ai_input_buttons.addWidget(self.ai_summarize_btn)
-        ai_input_buttons.addStretch(1)
-        ai_input_layout.addLayout(ai_input_buttons)
-        self.ai_copy_in_btn.clicked.connect(self.ai_copy_input_clicked)
-        self.ai_summarize_btn.clicked.connect(self.ai_summarize_clicked)
-        ai_split.addWidget(ai_input_group)
-
-        ai_output_group = QGroupBox("A.I. output")
-        ai_output_layout = QVBoxLayout(ai_output_group)
-        self.ai_output_text = QPlainTextEdit()
-        ai_output_layout.addWidget(self.ai_output_text, 1)
-        ai_output_buttons = QHBoxLayout()
-        self.ai_copy_out_btn = QPushButton("Copy text")
-        self.ai_post_btn = QPushButton("Post to X")
-        self.ai_schedule_btn = QPushButton("Schedule Post")
-        self.ai_view_scheduled_btn = QPushButton("View Scheduled")
-        for widget in (
-            self.ai_copy_out_btn,
-            self.ai_post_btn,
-            self.ai_schedule_btn,
-            self.ai_view_scheduled_btn,
-        ):
-            ai_output_buttons.addWidget(widget)
-        ai_output_buttons.addStretch(1)
-        ai_output_layout.addLayout(ai_output_buttons)
-        self.ai_copy_out_btn.clicked.connect(self.ai_copy_output_clicked)
-        self.ai_post_btn.clicked.connect(self.ai_post_clicked)
-        self.ai_schedule_btn.clicked.connect(self.ai_schedule_clicked)
-        self.ai_view_scheduled_btn.clicked.connect(self.view_scheduled_clicked)
-        ai_split.addWidget(ai_output_group)
+        feed_group = QGroupBox("Live News Feed")
+        feed_layout = QVBoxLayout(feed_group)
+        feed_controls = QHBoxLayout()
+        feed_controls.addWidget(QLabel("Symbols"))
+        self.feed_symbols_entry = QLineEdit()
+        self.feed_symbols_entry.setPlaceholderText("AAPL, MSFT, NVDA")
+        self.feed_symbols_entry.setMinimumWidth(80)
+        self.feed_symbols_entry.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.feed_apply_btn = QPushButton("Apply")
+        self.feed_refresh_btn = QPushButton("Refresh")
+        feed_controls.addWidget(self.feed_symbols_entry, 1)
+        feed_controls.addWidget(self.feed_apply_btn)
+        feed_controls.addWidget(self.feed_refresh_btn)
+        feed_layout.addLayout(feed_controls)
+        self.feed_status_label = QLabel("Enter comma- or space-separated symbols to start the feed.")
+        self.feed_status_label.setWordWrap(True)
+        self.feed_status_label.setMinimumWidth(0)
+        self.feed_status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        feed_layout.addWidget(self.feed_status_label)
+        self.feed_table = QTableWidget(0, 6)
+        self.feed_table.setHorizontalHeaderLabels(["Date", "Symbol", "Title", "Source", "Category", "Url"])
+        self.feed_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.feed_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.feed_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        feed_header = self.feed_table.horizontalHeader()
+        feed_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        feed_header.setStretchLastSection(False)
+        feed_header.setMinimumSectionSize(45)
+        self.feed_table.setColumnWidth(0, 135)
+        self.feed_table.setColumnWidth(1, 75)
+        self.feed_table.setColumnWidth(2, 360)
+        self.feed_table.setColumnWidth(3, 105)
+        self.feed_table.setColumnWidth(4, 90)
+        self.feed_table.setColumnWidth(5, 220)
+        self.feed_table.setSortingEnabled(True)
+        self.feed_table.sortItems(0, Qt.SortOrder.DescendingOrder)
+        feed_layout.addWidget(self.feed_table, 1)
+        self.feed_apply_btn.clicked.connect(self.apply_feed_symbols)
+        self.feed_refresh_btn.clicked.connect(self.refresh_news_feed)
+        self.feed_symbols_entry.returnPressed.connect(self.apply_feed_symbols)
+        self.feed_table.itemSelectionChanged.connect(self._on_feed_row_selected)
+        self.feed_table.cellDoubleClicked.connect(lambda _row, _column: self.open_link_clicked())
+        right_split.addWidget(feed_group)
 
         main_split.setSizes([660, 440])
         left_split.setSizes([370, 230])
         right_split.setSizes([220, 380])
-        ai_split.setSizes([190, 190])
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -465,8 +526,6 @@ class NewsHeadlinePosterWindow(QMainWindow):
         self.headline_table.setRowCount(0)
         self._clear_preview()
         self._clear_browser()
-        self.ai_input_text.clear()
-        self.ai_output_text.clear()
         self.load_btn.setEnabled(False)
         self._set_status(f"Loading headlines for {symbol.upper()}…")
 
@@ -531,6 +590,177 @@ class NewsHeadlinePosterWindow(QMainWindow):
         self.load_btn.setEnabled(True)
         self._set_status("Failed to load headlines.")
         QMessageBox.critical(self, "DB error", f"Could not load headlines.\n\n{error}")
+
+    @staticmethod
+    def _parse_feed_symbols(raw: str) -> list[str]:
+        candidates = re.split(r"[\s,;]+", raw.strip())
+        symbols: list[str] = []
+        for candidate in candidates:
+            symbol = candidate.strip().lstrip("$").upper()
+            if not symbol:
+                continue
+            if not re.fullmatch(r"[A-Z0-9^]{1,10}(?:[.-][A-Z0-9]{1,5})?", symbol):
+                raise ValueError(f"Invalid symbol: {candidate}")
+            if symbol not in symbols:
+                symbols.append(symbol)
+        return symbols
+
+    def apply_feed_symbols(self) -> None:
+        try:
+            symbols = self._parse_feed_symbols(self.feed_symbols_entry.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid symbols", str(exc))
+            return
+        if not symbols:
+            QMessageBox.information(self, "No symbols", "Enter one or more symbols for the news feed.")
+            return
+
+        self._feed_symbols = symbols
+        self.feed_symbols_entry.setText(", ".join(symbols))
+        self.refresh_news_feed()
+
+    def refresh_news_feed(self) -> None:
+        if not self._feed_symbols:
+            self.apply_feed_symbols()
+            return
+        self._feed_request_generation += 1
+        generation = self._feed_request_generation
+        self._feed_seen_ids.clear()
+        self._feed_last_id = 0
+        self.feed_table.setRowCount(0)
+        self._start_feed_request(generation, initial=True)
+
+    def _poll_news_feed(self) -> None:
+        if not self._feed_symbols or self._feed_refresh_in_progress:
+            return
+        self._start_feed_request(self._feed_request_generation, initial=False)
+
+    def _set_feed_status(self, message: str, symbols: list[str] | None = None) -> None:
+        self.feed_status_label.setText(message)
+        watched_symbols = self._feed_symbols if symbols is None else symbols
+        self.feed_status_label.setToolTip(
+            f"Watching: {', '.join(watched_symbols)}" if watched_symbols else ""
+        )
+
+    def _start_feed_request(self, generation: int, *, initial: bool) -> None:
+        self._feed_refresh_in_progress = True
+        self.feed_apply_btn.setEnabled(False)
+        self.feed_refresh_btn.setEnabled(False)
+        symbols = list(self._feed_symbols)
+        after_id = None if initial else self._feed_last_id
+        symbol_word = "symbol" if len(symbols) == 1 else "symbols"
+        self._set_feed_status(
+            f"Loading latest news for {len(symbols)} {symbol_word}…"
+            if initial
+            else f"Checking {len(symbols)} {symbol_word} for new rows…",
+            symbols,
+        )
+
+        self._start_worker(
+            lambda: retrieve_news_feed(symbols, after_id=after_id, limit=500),
+            lambda value: self._on_feed_rows_loaded(value, generation, initial),
+            lambda error: self._on_feed_rows_error(error, generation),
+        )
+
+    def _on_feed_rows_loaded(self, value: Any, generation: int, initial: bool) -> None:
+        if generation != self._feed_request_generation:
+            return
+        self._feed_refresh_in_progress = False
+        self.feed_apply_btn.setEnabled(True)
+        self.feed_refresh_btn.setEnabled(True)
+        df = value
+        required = {"id", "Ticker", "Title", "Url"}
+        if not required.issubset(df.columns):
+            self._set_feed_status("The news table returned an unexpected schema.")
+            return
+
+        rows: list[FeedRow] = []
+        for _, record in df.iterrows():
+            try:
+                news_id = int(record.get("id"))
+            except (TypeError, ValueError):
+                continue
+            row = FeedRow(
+                news_id=news_id,
+                ticker=str(record.get("Ticker", "") or "").strip().upper(),
+                title=str(record.get("Title", "") or "").strip(),
+                url=str(record.get("Url", "") or "").strip(),
+                date=_safe_dt(record.get("Date")),
+                source=str(record.get("Source")) if pd.notna(record.get("Source")) else None,
+                category=str(record.get("Category")) if pd.notna(record.get("Category")) else None,
+            )
+            if row.news_id not in self._feed_seen_ids and row.title:
+                rows.append(row)
+
+        sorting_enabled = self.feed_table.isSortingEnabled()
+        self.feed_table.setSortingEnabled(False)
+        for row in rows:
+            table_row = self.feed_table.rowCount() if initial else 0
+            self.feed_table.insertRow(table_row)
+            values = [
+                row.date.strftime("%Y-%m-%d %H:%M") if row.date else "",
+                row.ticker,
+                row.title,
+                row.source or "",
+                row.category or "",
+                row.url,
+            ]
+            for column_index, value_text in enumerate(values):
+                item = QTableWidgetItem(value_text)
+                if column_index == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, row)
+                self.feed_table.setItem(table_row, column_index, item)
+            self._feed_seen_ids.add(row.news_id)
+            self._feed_last_id = max(self._feed_last_id, row.news_id)
+
+        while self.feed_table.rowCount() > 500:
+            bottom_row = self.feed_table.rowCount() - 1
+            item = self.feed_table.item(bottom_row, 0)
+            old_row = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if isinstance(old_row, FeedRow):
+                self._feed_seen_ids.discard(old_row.news_id)
+            self.feed_table.removeRow(bottom_row)
+        self.feed_table.setSortingEnabled(sorting_enabled)
+        if sorting_enabled:
+            self.feed_table.sortItems(0, Qt.SortOrder.DescendingOrder)
+
+        symbol_count = len(self._feed_symbols)
+        symbol_word = "symbol" if symbol_count == 1 else "symbols"
+        if initial:
+            message = f"Showing {len(rows)} current row(s) for {symbol_count} {symbol_word}."
+        elif rows:
+            message = f"Added {len(rows)} new row(s). Watching {symbol_count} {symbol_word}."
+        else:
+            message = f"Live — watching {symbol_count} {symbol_word}."
+        self._set_feed_status(message)
+
+    def _on_feed_rows_error(self, error: str, generation: int) -> None:
+        if generation != self._feed_request_generation:
+            return
+        self._feed_refresh_in_progress = False
+        self.feed_apply_btn.setEnabled(True)
+        self.feed_refresh_btn.setEnabled(True)
+        self._set_feed_status(f"Feed refresh failed: {error}")
+
+    def _on_feed_row_selected(self) -> None:
+        selected = self.feed_table.selectionModel().selectedRows()
+        if not selected:
+            return
+        date_item = self.feed_table.item(selected[0].row(), 0)
+        row = date_item.data(Qt.ItemDataRole.UserRole) if date_item else None
+        if not isinstance(row, FeedRow):
+            return
+        self._selected_symbol = row.ticker.lower()
+        self._selected_row = HeadlineRow(
+            title=row.title,
+            url=row.url,
+            date=row.date,
+            source=row.source,
+            category=row.category,
+        )
+        self.title_text.setPlainText(self._tweet_text_for_selection())
+        self.link_entry.setText(row.url)
+        self._maybe_open_link_in_browser()
 
     def _on_row_selected(self) -> None:
         selected = self.headline_table.selectionModel().selectedRows()
@@ -655,55 +885,6 @@ class NewsHeadlinePosterWindow(QMainWindow):
         if self.open_link_check.isChecked() and self.link_entry.text().strip():
             self._load_browser_url(self.link_entry.text())
 
-    def ai_copy_input_clicked(self) -> None:
-        copied = self.web.page().selectedText().strip()
-        if not copied:
-            copied = QApplication.clipboard().text().strip()
-        if not copied:
-            QMessageBox.information(self, "No text", "Highlight text in the Browser panel first.")
-            return
-        self.ai_input_text.setPlainText(copied)
-        self._set_status("Copied text into A.I. input.")
-
-    def _summarize_with_openai(self, copied_text: str) -> str:
-        from api_keys import open_ai as oai_key
-
-        if oai_key and not os.environ.get("OPENAI_API_KEY"):
-            os.environ["OPENAI_API_KEY"] = oai_key
-        from openai import OpenAI
-
-        response = OpenAI().responses.create(
-            model="gpt-5.2",
-            input=f"In less than 300 characters summarize the following article:\n{copied_text}",
-            reasoning={"effort": "none"},
-            text={"verbosity": "low"},
-        )
-        summary = str(getattr(response, "output_text", "") or "")
-        return summary if summary.strip() else str(response)
-
-    def ai_summarize_clicked(self) -> None:
-        copied = self.ai_input_text.toPlainText().rstrip()
-        if not copied.strip():
-            QMessageBox.information(self, "Nothing to summarize", "Copy some text into the A.I. input box first.")
-            return
-        self.ai_summarize_btn.setEnabled(False)
-        self._set_status("Summarizing…")
-        self._start_worker(
-            lambda: self._summarize_with_openai(copied),
-            self._on_summarize_done,
-            self._on_summarize_error,
-        )
-
-    def _on_summarize_done(self, value: Any) -> None:
-        self.ai_summarize_btn.setEnabled(True)
-        self.ai_output_text.setPlainText(str(value).strip())
-        self._set_status("Summary ready.")
-
-    def _on_summarize_error(self, error: str) -> None:
-        self.ai_summarize_btn.setEnabled(True)
-        self._set_status("Summarize failed.")
-        QMessageBox.critical(self, "Summarize failed", error)
-
     def copy_tweet_text_clicked(self) -> None:
         text = self._current_tweet_text()
         if not text:
@@ -711,14 +892,6 @@ class NewsHeadlinePosterWindow(QMainWindow):
             return
         QApplication.clipboard().setText(text)
         self._set_status("Copied tweet text to clipboard.")
-
-    def ai_copy_output_clicked(self) -> None:
-        text = self.ai_output_text.toPlainText().rstrip()
-        if not text:
-            QMessageBox.information(self, "No text", "No A.I. output to copy yet.")
-            return
-        QApplication.clipboard().setText(text)
-        self._set_status("Copied A.I. output to clipboard.")
 
     def _validate_post_text(self, text: str, empty_message: str, action: str) -> bool:
         if not text.strip():
@@ -734,9 +907,6 @@ class NewsHeadlinePosterWindow(QMainWindow):
             QMessageBox.information(self, "No symbol", "Select a symbol first.")
             return
         self._post_text(self._current_tweet_text(), self.link_entry.text().strip() or None, self.post_btn)
-
-    def ai_post_clicked(self) -> None:
-        self._post_text(self.ai_output_text.toPlainText().rstrip(), self.link_entry.text().strip() or None, self.ai_post_btn)
 
     def _post_text(self, text: str, link: str | None, button: QPushButton) -> None:
         if not self._validate_post_text(text, "Enter or generate text first.", "post"):
@@ -771,11 +941,6 @@ class NewsHeadlinePosterWindow(QMainWindow):
             return
         text = self._current_tweet_text()
         if self._validate_post_text(text, "Enter or select a headline first.", "schedule"):
-            self._open_schedule_dialog(text, self.link_entry.text().strip() or None)
-
-    def ai_schedule_clicked(self) -> None:
-        text = self.ai_output_text.toPlainText().rstrip()
-        if self._validate_post_text(text, "Enter or generate A.I. output first.", "schedule"):
             self._open_schedule_dialog(text, self.link_entry.text().strip() or None)
 
     def _open_schedule_dialog(self, tweet_text: str, link: str | None) -> None:
@@ -826,7 +991,6 @@ class NewsHeadlinePosterWindow(QMainWindow):
 
     def _schedule_post(self, tweet_text: str, link: str | None, scheduled_time: datetime) -> None:
         self.schedule_btn.setEnabled(False)
-        self.ai_schedule_btn.setEnabled(False)
         self._set_status("Scheduling post…")
 
         def schedule() -> datetime:
@@ -843,7 +1007,6 @@ class NewsHeadlinePosterWindow(QMainWindow):
 
         def finish_buttons() -> None:
             self.schedule_btn.setEnabled(True)
-            self.ai_schedule_btn.setEnabled(True)
 
         def done(value: Any) -> None:
             finish_buttons()
@@ -1055,6 +1218,7 @@ class NewsHeadlinePosterWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:
         self._updates_timer.stop()
+        self._feed_timer.stop()
         if self._workers:
             self._closing = True
             self.setEnabled(False)
