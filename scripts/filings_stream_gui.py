@@ -23,8 +23,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import queue
+import re
 import subprocess
 import sys
+import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -108,6 +112,208 @@ def _color_to_bg_css(color: str) -> str:
     if color == "yellow":
         return "#fff4e5"  # light amber
     return "#ffffff"
+
+
+class BiotechFilingStore:
+    """Persist biotechnology filings without doing network or DB work on GUI threads."""
+
+    _STOP = object()
+    _INDUSTRY_REFRESH_SECONDS = 300
+
+    def __init__(self, on_log=None) -> None:
+        self._on_log = on_log
+        self._queue: queue.SimpleQueue[dict[str, Any] | object] = queue.SimpleQueue()
+        self._stop_requested = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="biotech-filing-store",
+            daemon=True,
+        )
+        self._seen_links: set[str] = set()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def enqueue(self, payload: dict[str, Any]) -> None:
+        if self._stop_requested.is_set():
+            return
+        # SimpleQueue.put() is non-blocking, so this path cannot delay the stream.
+        self._queue.put(dict(payload or {}))
+
+    def request_stop(self) -> None:
+        self._stop_requested.set()
+        self._queue.put(self._STOP)
+
+    def _log(self, line: str) -> None:
+        if self._on_log is None:
+            return
+        try:
+            self._on_log(line)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _load_biotech_symbols(connection, text) -> set[str]:
+        rows = connection.execute(
+            text(
+                """
+                SELECT symbol
+                FROM stocks.symbol_sector_industry
+                WHERE LOWER(TRIM(industry)) = :industry
+                """
+            ),
+            {"industry": "biotechnology"},
+        )
+        return {
+            str(row[0]).strip().upper()
+            for row in rows
+            if row[0] is not None and str(row[0]).strip()
+        }
+
+    @staticmethod
+    def _accession_no(payload: dict[str, Any], link: str) -> str:
+        raw = str(
+            payload.get("accession_no")
+            or payload.get("accessionNo")
+            or ""
+        ).strip()
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) != 18:
+            match = re.search(r"/(\d{18})(?:/|$)", link)
+            digits = match.group(1) if match else ""
+        if len(digits) != 18:
+            raise ValueError("could not determine the SEC accession number")
+        return f"{digits[:10]}-{digits[10:12]}-{digits[12:]}"
+
+    @staticmethod
+    def _filed_at(payload: dict[str, Any]) -> datetime:
+        raw = str(
+            payload.get("filed_at")
+            or payload.get("filedAt")
+            or ""
+        ).strip()
+        if not raw:
+            raise ValueError("filing timestamp is missing")
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise ValueError(f"invalid filing timestamp: {raw}") from e
+        # MySQL DATETIME is timezone-naive. Preserve the SEC timestamp's displayed
+        # wall-clock value, which is how existing rows in this table are stored.
+        return parsed.replace(tzinfo=None)
+
+    def _run(self) -> None:
+        engine = None
+        try:
+            from api_keys import news_database, sec_api_key  # type: ignore
+            from sec_api import RenderApi  # type: ignore
+            from sqlalchemy import create_engine, text
+            from sqlalchemy.engine import URL
+
+            engine = create_engine(
+                URL.create(
+                    "mysql+pymysql",
+                    username="root",
+                    password=news_database,
+                    host="127.0.0.1",
+                    port=3306,
+                    database="stocks",
+                ),
+                pool_pre_ping=True,
+                connect_args={"connect_timeout": 5},
+            )
+            renderer = RenderApi(api_key=sec_api_key)
+
+            with engine.connect() as connection:
+                biotech_symbols = self._load_biotech_symbols(connection, text)
+            symbols_loaded_at = time.monotonic()
+            self._log(
+                f"[Biotech filings] Monitoring {len(biotech_symbols)} biotechnology symbol(s)."
+            )
+        except Exception as e:
+            self._log(f"[Biotech filings] Disabled because initialization failed: {e}")
+            if engine is not None:
+                engine.dispose()
+            return
+
+        try:
+            while not self._stop_requested.is_set():
+                try:
+                    item = self._queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if item is self._STOP:
+                    break
+                if not isinstance(item, dict):
+                    continue
+
+                ticker = str(item.get("ticker") or "").strip().upper()
+                form_type = str(item.get("form_type") or "").strip()
+                link = str(item.get("link") or "").strip()
+                if not ticker or not link or link in self._seen_links:
+                    continue
+
+                try:
+                    if (
+                        time.monotonic() - symbols_loaded_at
+                        >= self._INDUSTRY_REFRESH_SECONDS
+                    ):
+                        with engine.connect() as connection:
+                            biotech_symbols = self._load_biotech_symbols(connection, text)
+                        symbols_loaded_at = time.monotonic()
+
+                    if ticker not in biotech_symbols:
+                        continue
+
+                    filing_html = renderer.get_filing(link)
+                    if not isinstance(filing_html, str) or not filing_html.strip():
+                        raise ValueError("SEC API returned an empty filing")
+                    accession_no = self._accession_no(item, link)
+                    filed_at = self._filed_at(item)
+
+                    with engine.begin() as connection:
+                        connection.execute(
+                            text(
+                                """
+                                INSERT INTO filings.biotech_filings
+                                    (
+                                        symbol,
+                                        form_type,
+                                        filing,
+                                        accession_no,
+                                        filed_at,
+                                        filing_link
+                                    )
+                                VALUES
+                                    (
+                                        :symbol,
+                                        :form_type,
+                                        :filing,
+                                        :accession_no,
+                                        :filed_at,
+                                        :filing_link
+                                    )
+                                """
+                            ),
+                            {
+                                "symbol": ticker,
+                                "form_type": form_type,
+                                "filing": filing_html,
+                                "accession_no": accession_no,
+                                "filed_at": filed_at,
+                                "filing_link": link,
+                            },
+                        )
+                    self._seen_links.add(link)
+                    self._log(f"[Biotech filings] Stored {ticker} {form_type}.")
+                except Exception as e:
+                    # A failed retrieval or insert affects only this filing.
+                    self._log(f"[Biotech filings] Could not store {ticker} {form_type}: {e}")
+        finally:
+            engine.dispose()
 
 
 class StreamWorker(QThread):
@@ -462,6 +668,8 @@ class XScheduleWorker(QThread):
 
 
 class FilingsStreamWindow(QMainWindow):
+    biotech_log_line = pyqtSignal(str)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SEC Filings Stream — News Tracker")
@@ -476,8 +684,10 @@ class FilingsStreamWindow(QMainWindow):
         self._max_feed_history = 2000
         self._store_feed_data = False
         self._settings = QSettings("NewsTracker", "FilingsStreamGui")
+        self._biotech_store: BiotechFilingStore | None = None
 
         self._build_ui()
+        self.biotech_log_line.connect(self.append_log)
         self._load_checkbox_settings()
         self._set_running(False)
 
@@ -682,6 +892,11 @@ class FilingsStreamWindow(QMainWindow):
         if not ev.ticker and not ev.link:
             return
 
+        # This receives both the optional startup prefetch and the live stream.
+        # Persistence is queued before display filtering and runs entirely off-thread.
+        if self._biotech_store is not None:
+            self._biotech_store.enqueue(payload)
+
         # Apply ticker filter (case-insensitive). If set, only show matching tickers.
         if self._ticker_filter is not None:
             t = (ev.ticker or "").strip().upper()
@@ -880,6 +1095,12 @@ class FilingsStreamWindow(QMainWindow):
         self._store_feed_data = self.store_data_chk.isChecked()
         if self.clear_log_chk.isChecked() and not self._clear_data_log_file():
             return
+
+        if self._biotech_store is None or not self._biotech_store.is_alive():
+            self._biotech_store = BiotechFilingStore(
+                on_log=self.biotech_log_line.emit
+            )
+            self._biotech_store.start()
 
         def _start_live_stream() -> None:
             self._worker = StreamWorker()
@@ -1323,6 +1544,8 @@ class FilingsStreamWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._save_checkbox_settings()
+        if self._biotech_store is not None:
+            self._biotech_store.request_stop()
         # Best-effort stop the stream thread cleanly on window close.
         try:
             self.stop_stream()
